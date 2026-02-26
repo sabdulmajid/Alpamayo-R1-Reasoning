@@ -1,0 +1,20 @@
+# Environments
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Heavy local/model sources
+alpamayo_src/
+
+# Runtime artifacts
+logs/
+results/
+
+# Dataset/cache artifacts
+data/
+.cache/
+
+# OS/editor
+.DS_Store
+.vscode/
