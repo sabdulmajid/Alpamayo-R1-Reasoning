@@ -1,0 +1,9 @@
+name: alpamayo-r1-research
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12.12
+  - pip=25.3
+  - pip:
+      - -r requirements/core.txt
