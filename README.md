@@ -301,6 +301,27 @@ The script accepts these optional environment variables:
 
 The process resumes only when an existing artifact has the correct configuration and identity. Set `OVERWRITE=1` to replace an incompatible artifact.
 
+## Recorded-Future LiDAR Oracle
+
+The LiDAR oracle is an evaluation tool. It compares each trajectory candidate with LiDAR data from later times.
+
+The tool makes bird's-eye-view (BEV) grids. A BEV grid is a two-dimensional map around the ego vehicle.
+
+The tool does these operations:
+
+1. Correct each LiDAR point for ego motion.
+2. Transform each point to the ego frame at the planning timestamp.
+3. Make past and future occupancy grids.
+4. Move the vehicle footprint along each trajectory candidate.
+5. Calculate collision, clearance, observed-space, and out-of-bounds values.
+6. Make an evaluation rank for the candidates.
+
+The tool treats unobserved space and out-of-bounds space as unknown. A candidate cannot get the best rank because it moves through unknown space.
+
+The oracle is not an interactive simulator. Other road users follow the recorded ego action and do not react to the trajectory candidates.
+
+Read [`docs/lidar_world_oracle.md`](docs/lidar_world_oracle.md) for the coordinate equation, file schema, commands, and limits.
+
 ## References
 
 - [Alpamayo-R1 model card](https://huggingface.co/nvidia/Alpamayo-R1-10B)
