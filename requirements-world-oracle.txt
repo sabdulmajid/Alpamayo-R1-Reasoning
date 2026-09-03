@@ -1,0 +1,6 @@
+DracoPy==2.0.0
+numpy==2.3.5
+pandas==2.3.3
+physical-ai-av==0.1.0
+pyarrow==21.0.0
+scipy==1.16.3
