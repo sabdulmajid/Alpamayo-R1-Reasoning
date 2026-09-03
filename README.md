@@ -322,6 +322,25 @@ The oracle is not an interactive simulator. Other road users follow the recorded
 
 Read [`docs/lidar_world_oracle.md`](docs/lidar_world_oracle.md) for the coordinate equation, file schema, commands, and limits.
 
+## Predictive BEV World Model
+
+The world model uses past BEV grids to calculate future occupancy probabilities. A convolutional gated recurrent unit processes the time sequence.
+
+The world-model process has these parts:
+
+- Dataset groups that do not share a LiDAR source chunk
+- Checkpoints that support an exact restart
+- A persistence baseline
+- Metrics that use only observed cells
+- Output files that identify all source files
+- SLURM scripts that use one GPU
+
+The candidate selector uses only predicted occupancy and trajectory data. It does not use the recorded-future occupancy or the oracle rank.
+
+The repository does not contain a trained result. The acceptance limits in the implementation guide are test requirements, not results.
+
+Read [`docs/bev_world_model.md`](docs/bev_world_model.md) for the data contract, commands, metrics, and acceptance limits.
+
 ## References
 
 - [Alpamayo-R1 model card](https://huggingface.co/nvidia/Alpamayo-R1-10B)
