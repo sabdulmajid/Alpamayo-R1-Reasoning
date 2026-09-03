@@ -1,232 +1,308 @@
-# Alpamayo-R1 Reasoning–Action Mismatch Study
+# Alpamayo-R1 Reasoning and Action Study
 
-This project asks one technical question: when Alpamayo-R1 explains its driving decision in language, does its predicted trajectory execute the same decision?
+## Purpose
 
-The model produces two outputs for the same scene:
-- a chain-of-causation (CoC) text explanation
-- a 6.4-second future trajectory (64 waypoints)
+This project measures agreement between the language output and the trajectory output of Alpamayo-R1.
 
-Mismatch is the gap between those two outputs.
+The model gives two outputs for each driving scene:
 
-## What Was Tested
+- A Chain of Causation (CoC) explanation
+- A 6.4-second trajectory with 64 waypoints
 
-### End-to-end test flow (simple example)
+The study compares the driving intent in the CoC with the action in the trajectory. The term `mismatch` identifies a difference between these outputs.
 
-Given one clip at time \(t_0\):
+## Test Method
 
-1. The model sees multi-camera context and ego-motion history.
-2. It generates text such as “slow down for red light” or “nudge left for clearance.”
-3. It generates future waypoints that imply actual executed behavior (decelerating, straight, lane shift, lane change).
-4. We parse text intent and trajectory execution independently and compare them.
+The test uses this sequence:
 
-If text says “slow down” but trajectory accelerates, mismatch is high. If both agree, mismatch is low.
+1. Load the camera data and the ego-motion history.
+2. Generate the CoC output.
+3. Generate the future trajectory.
+4. Classify the intent in the CoC.
+5. Classify the action in the trajectory.
+6. Compare the two classes.
 
-### Experimental design
+For example, a CoC can give an instruction to decrease speed. A trajectory that increases speed has a high mismatch score.
 
-- Model: Alpamayo-R1-10B in native bf16 (no quantization)
-- Compute constraint: single NVIDIA RTX A4500 (20GB VRAM)
-- Dataset: PhysicalAI-Autonomous-Vehicles test split
-- Evaluation set: 2,000 clips, stratified by hour-of-day (balanced across 5 buckets)
-- Runtime strategy: batched + resumable execution to complete long runs under strict single-GPU limits
+### Test Configuration
 
-## How Mismatch Was Measured
+| Item | Value |
+| --- | --- |
+| Model | Alpamayo-R1-10B |
+| Precision | Native `bfloat16` |
+| GPU | One NVIDIA RTX A4500 with 20 GB of memory |
+| Dataset | PhysicalAI Autonomous Vehicles test split |
+| Evaluation size | 2,000 clips |
+| Sample design | 400 clips from each of five time groups |
+| Execution | Resumable batches on one GPU |
 
-Mismatch was computed on two axes so failure modes are visible instead of hidden in one score.
+The clip sampler uses a camera-safe planning timestamp. This limit prevents invalid samples near the limits of the camera data.
 
-1. **Longitudinal axis (speed intent)**
-	- Text intent classes: stop, slow_down, maintain, accelerate
-	- Trajectory execution classes: stopped, decelerating, constant_speed, accelerating
+## Mismatch Score
 
-2. **Lateral axis (steering intent)**
-	- Text intent classes: hold_lane, nudge_left/right, lane_change_left/right
-	- Trajectory execution classes: straight, shift_left/right, lane_change_left/right
+The test measures longitudinal intent and lateral intent separately.
 
-Each axis uses an explicit compatibility matrix. Final mismatch score is \(1 - \text{compatibility}\), where 0 means full agreement and 1 means contradiction.
+### Longitudinal Classes
 
-## What Was Done to Make Results Valid
+The CoC parser uses these intent classes:
 
-Early runs exposed two important methodological issues, both fixed before the final 2,000-clip run:
+- `stop`
+- `slow_down`
+- `maintain`
+- `accelerate`
 
-1. **Timestamp validity issue**
-	- Initial clip sampling used a wider \(t_0\) range and produced many invalid samples because camera coverage was tighter than egomotion coverage.
-	- Fix: enforce a camera-safe \(t_0\) window and resample.
+The trajectory classifier uses these action classes:
 
-2. **Text parser undercoverage issue**
-	- Early parser missed common CoC phrasing (“keep distance,” “adapt speed,” “yield,” curve-following language).
-	- Fix: expand intent patterns, then re-score to confirm the previous “unclassified” bucket was mostly parser blind spots.
+- `stopped`
+- `decelerating`
+- `constant_speed`
+- `accelerating`
 
-## Final Results (2,000 clips)
+### Lateral Classes
 
-All metrics below are computed on the final 2,000-clip run.
+The CoC parser uses these intent classes:
 
-- Clips processed: **2,000 / 2,000**
-- Valid scored results: **2,000 / 2,000**
-- Runtime failures: **0**
-- Mean mismatch score: **0.4991** (95% CI: **0.4839–0.5143**, SD: 0.3463)
-- Mean ADE: **1.9391 m** (95% CI: **1.8556–2.0226**, SD: 1.9047)
-- Mean longitudinal match: **0.6125** (95% CI: **0.5963–0.6288**)
-- Mean lateral match: **0.3776** (95% CI: **0.3639–0.3913**)
+- `hold_lane`
+- `nudge_left`
+- `nudge_right`
+- `lane_change_left`
+- `lane_change_right`
 
-Mismatch severity distribution:
+The trajectory classifier uses these action classes:
 
-- Consistent (`score < 0.3`): **531 / 2000 = 26.55%** (95% CI: 24.61–28.49%)
-- Partial (`0.3 <= score < 0.6`): **636 / 2000 = 31.80%** (95% CI: 29.76–33.84%)
-- Severe (`score >= 0.6`): **833 / 2000 = 41.65%** (95% CI: 39.49–43.81%)
+- `straight`
+- `shift_left`
+- `shift_right`
+- `lane_change_left`
+- `lane_change_right`
 
-## Technical Deep-Dive: How Conclusions Were Derived
+Each axis has a documented compatibility matrix. The mismatch score is `1 - compatibility`.
 
-### 1) Axis asymmetry is large and statistically stable
+A score of `0` shows full agreement. A score of `1` shows a contradiction.
 
-Observed difference between longitudinal and lateral match:
+## Results
 
-- `mean(long_match - lat_match) = 0.2349`
-- 95% CI: **0.2131–0.2568**
+The final run processed all 2,000 clips. The run had no runtime failures.
 
-This gap excludes zero by a wide margin, so the two axes are not behaving similarly. The lateral axis is systematically harder to align than the speed axis in this setup.
+CI means 95 percent confidence interval.
 
-### 2) “Mismatch” is not only a tail event
+| Metric | Result |
+| --- | ---: |
+| Valid clips | 2,000 of 2,000 |
+| Mean mismatch | 0.4991, CI 0.4839 to 0.5143 |
+| Mismatch standard deviation | 0.3463 |
+| Mean average displacement error (ADE) | 1.9391 m, CI 1.8556 m to 2.0226 m |
+| ADE standard deviation | 1.9047 m |
+| Mean longitudinal match | 0.6125, CI 0.5963 to 0.6288 |
+| Mean lateral match | 0.3776, CI 0.3639 to 0.3913 |
 
-Severe mismatch is **41.65%**, not a rare outlier bucket. Combined partial+severe is **73.45%**. This directly establishes that disagreement is common under this scoring protocol.
+### Mismatch Levels
 
-### 3) Scenario differences are real but second-order
+| Level | Score range | Clips | Rate | CI |
+| --- | --- | ---: | ---: | ---: |
+| Consistent | Less than 0.3 | 531 | 26.55 percent | 24.61 to 28.49 percent |
+| Partial | 0.3 to less than 0.6 | 636 | 31.80 percent | 29.76 to 33.84 percent |
+| Severe | 0.6 or more | 833 | 41.65 percent | 39.49 to 43.81 percent |
 
-Balanced design gives 400 clips per hour bucket. Severe rates:
+### Difference Between the Two Axes
 
-- Midday: **38.50%**
-- Morning: **41.50%**
-- Afternoon: **42.25%**
-- Night: **42.75%**
-- Evening: **43.25%**
+The mean difference between the longitudinal match and the lateral match is 0.2349. The CI is 0.2131 to 0.2568.
 
-Interpretation: mismatch exists in all buckets; time-of-day shifts are modest relative to the global mismatch level.
+The interval does not include zero. Thus, the two axes have different agreement rates in this test.
 
-### 4) Error anatomy from intent-execution cross-tabs
+### Results for Each Time Group
 
-Most frequent longitudinal pairings:
+| Time group | Severe mismatch rate |
+| --- | ---: |
+| Midday | 38.50 percent |
+| Morning | 41.50 percent |
+| Afternoon | 42.25 percent |
+| Night | 42.75 percent |
+| Evening | 43.25 percent |
 
-- `maintain -> constant_speed`: 540
-- `maintain -> accelerating`: 316
-- `slow_down -> decelerating`: 204
-- `slow_down -> constant_speed`: 171
+Each time group has 400 clips. The difference between time groups is smaller than the total severe mismatch rate.
 
-Most frequent lateral pairings:
+### Frequent Class Pairs
 
-- `hold_lane -> lane_change_right`: 198
-- `hold_lane -> lane_change_left`: 175
-- `hold_lane -> shift_right`: 160
-- `hold_lane -> shift_left`: 157
-- `hold_lane -> straight`: 134
+The most frequent longitudinal pairs are:
 
-These cross-tabs are the basis for the geometry-confound claim: the dominant lateral contradiction pattern is not random; it is concentrated in `hold_lane` text against non-straight ego-frame execution classes.
+| CoC intent | Trajectory action | Count |
+| --- | --- | ---: |
+| `maintain` | `constant_speed` | 540 |
+| `maintain` | `accelerating` | 316 |
+| `slow_down` | `decelerating` | 204 |
+| `slow_down` | `constant_speed` | 171 |
 
-## Conclusions (Supported by Current Data)
+The most frequent lateral pairs are:
 
-1. **Under this protocol, reasoning-action mismatch is quantitatively high** (mean 0.499; severe 41.65%).
+| CoC intent | Trajectory action | Count |
+| --- | --- | ---: |
+| `hold_lane` | `lane_change_right` | 198 |
+| `hold_lane` | `lane_change_left` | 175 |
+| `hold_lane` | `shift_right` | 160 |
+| `hold_lane` | `shift_left` | 157 |
+| `hold_lane` | `straight` | 134 |
 
-2. **Mismatch is axis-dependent**: longitudinal alignment is materially higher than lateral alignment by ~0.235 absolute points (tight CI).
+## Conclusions
 
-3. **The current lateral estimate is likely upward-biased by representation effects**: dominant contradiction pairs are consistent with ego-frame curvature aliasing (lane-following on curved roads mapped to lateral shift/change labels).
+The test gives these conclusions:
 
-4. **Therefore, the study has already established a robust discrepancy signal, but not a pure causal decomposition** between true decision inconsistency and coordinate-frame artifact.
+1. The mean mismatch score is 0.4991 under this test protocol.
+2. Severe mismatch occurs in 41.65 percent of the clips.
+3. Longitudinal agreement is higher than lateral agreement.
+4. The lateral score can include an error from the coordinate representation.
 
-## Data-Backed Next Steps (Decision-Oriented)
+The fourth conclusion is an important limit. A curved road can cause lateral movement in the ego frame without a lane change.
 
-### Next Step A — Curvature-normalized lateral scoring (highest priority)
+Thus, the current lateral mismatch is an upper estimate. The study does not separate all representation errors from model behavior.
 
-What to add:
-- derive road-following baseline from trajectory curvature and heading change
-- reclassify lateral execution relative to that baseline (instead of raw ego-y displacement)
+## Limits
 
-Decision criterion:
-- If severe mismatch drops by **>= 10 absolute points** and most reduction comes from `hold_lane -> lane_change_* / shift_*`, current lateral contradiction is mostly representational.
-- If reduction is **< 5 points**, contradiction is mostly model-behavioral.
+The results have these limits:
 
-### Next Step B — Parser ablation with frozen trajectories
+- The intent classes and the compatibility matrix define the mismatch score.
+- The CoC parser can assign an incorrect intent when the text is not clear.
+- The lateral classifier uses movement in the ego frame.
+- The test uses one model family and one dataset family.
+- The test uses one GPU type and one software environment.
 
-What to run:
-- score same 2,000 trajectories with parser variants (strict / current / expanded)
+The correlation between mismatch and ADE is 0.1234. Thus, mismatch is not a sufficient measure of trajectory quality.
 
-Decision criterion:
-- If severe mismatch variance across parser versions is **> 5 points**, conclusions are parser-sensitive and must be reported with parser uncertainty.
-- If **<= 2 points**, conclusions are parser-robust.
+## Recommended Follow-up Tests
 
-### Next Step C — Outcome coupling test (mismatch vs trajectory quality)
+### Curvature Correction
 
-Current signal:
-- corr(mismatch, ADE) = **0.1234** (weak positive)
-- mean ADE by band: consistent 1.810m, partial 1.693m, severe 2.209m
+Calculate lateral movement relative to a road-following baseline. Then compare the corrected result with the current result.
 
-What to do:
-- run controlled analysis (stratify by scenario + speed regime)
+Use these decision limits:
 
-Decision criterion:
-- If severe retains significantly higher ADE after stratification, mismatch is safety-relevant.
-- If effect collapses, mismatch is mostly semantic labeling noise.
+- A decrease of 10 percentage points or more shows a large representation effect.
+- A decrease of less than 5 percentage points shows a small representation effect.
 
-### Next Step D — Human audit on targeted slice
+### Parser Test
 
-What to sample:
-- 200 clips: top 100 severe `hold_lane` contradictions + 100 matched controls
+Apply strict, current, and expanded parsers to the same 2,000 trajectories.
 
-Decision criterion:
-- Annotator agreement identifies whether each case is true contradiction vs curvature artifact.
-- This becomes the calibration set for metric correction and paper claims.
+Use these decision limits:
 
-## Threats to Validity
+- A difference of more than 5 percentage points shows high parser sensitivity.
+- A difference of 2 percentage points or less shows low parser sensitivity.
 
-### 1) Construct validity (does the metric measure what we claim?)
+### Outcome Test
 
-Primary risk: lateral mismatch partly captures coordinate/frame effects, not only behavioral contradiction.
+Compare mismatch with ADE after controls for the time group and the speed range.
 
-Evidence from current run:
-- dominant conflict mass is `hold_lane -> lane_change_* / shift_*`
-- lateral execution classes are heavily non-straight (`lane_change_right=542`, `lane_change_left=456`, `shift_right=316`, `shift_left=288`, `straight=398`)
+A persistent ADE difference gives evidence that mismatch relates to trajectory quality. A removed difference gives evidence of classification noise.
 
-Consequence:
-- current lateral mismatch is an upper-bound estimate of contradiction, not a geometry-corrected estimate.
+### Human Review
 
-### 2) Internal validity (could pipeline artifacts drive findings?)
+Review 200 clips. Use 100 severe `hold_lane` cases and 100 matched control cases.
 
-Known mitigations already applied:
-- camera-safe `t0` sampling to avoid invalid timestamp windows
-- parser expansion to reduce false “unclassified” labels
-- deterministic batch processing with complete run (2,000/2,000, zero runtime failures)
+The review must identify a true contradiction or a representation error for each case. This review can supply labels for metric correction.
 
-Residual risk:
-- parser still defines intent boundaries; some semantic ambiguity remains unavoidable without human labels.
+## Reproducible Candidate Generation
 
-### 3) External validity (how far do these results generalize?)
+The file `src/generate_candidates.py` supplies a separate candidate-generation process. This process does not change the completed mismatch experiment.
 
-Current scope limitations:
-- one model family (Alpamayo-R1-10B)
-- one dataset family (PhysicalAI-AV test split)
-- one hardware/runtime regime (single A4500, bf16 + offload strategy)
+The default process uses these generation values:
 
-Consequence:
-- conclusions are valid for this protocol and setup; cross-model and cross-dataset claims require replication.
+| Item | Value |
+| --- | ---: |
+| Candidate count | 6 |
+| Samples in each rollout | 1 |
+| Top-p | 0.98 |
+| Temperature | 0.6 |
+| Maximum generation length | 256 tokens |
 
-### 4) Statistical conclusion validity
+The process pins the model, the dataset, and the Alpamayo source to immutable revisions.
 
-Strengths:
-- balanced design (400 clips per hour bucket)
-- narrow CIs on core metrics at N=2000
+The process calculates a seed from the base seed, clip ID, and planning timestamp. It also calculates and records one seed for each candidate.
 
-Limits:
-- effect interpretation is sensitive to class definition and compatibility matrix choices.
-- weak mismatch–ADE correlation (`r=0.1234`) means mismatch is not yet a strong standalone proxy for trajectory quality.
+The process uses six separate rollouts to make six candidates. This method avoids the device error that occurred in a two-GPU rollout test.
 
-### Reviewer-facing summary
+The validated cluster test used one NVIDIA RTX A4500 and CPU offload. The test made six different trajectories for one clip.
 
-What is strong:
-- high mismatch prevalence under an explicit, reproducible scoring protocol
-- stable axis asymmetry (longitudinal > lateral) with tight uncertainty
+Exact numeric results can change with different CUDA hardware or software versions.
 
-What is not yet closed:
-- causal separation of true reasoning inconsistency vs representation-induced lateral inflation
-- portability of effect sizes beyond this model/dataset protocol
+### Candidate Output
+
+The process writes one set of files for each completed clip:
+
+| Path | Content |
+| --- | --- |
+| `artifacts/<key>.npz` | Trajectories, sample times, seeds, text, ground truth, and clip identity |
+| `records/<key>.json` | Configuration, metrics, seeds, and the artifact path |
+| `manifests/shard-xxxxx-of-yyyyy.jsonl` | Completed records for one shard |
+
+The process writes each file atomically. Each SLURM task writes a separate manifest.
+
+The field `oracle_min_ade_candidate_index` uses ground-truth ADE. This field is only for evaluation and is not a deployment selector.
+
+Use this command to make one metrics file after all shards are complete:
+
+```bash
+python src/export_candidate_metrics.py \
+  --records-dir results/candidates_k6/records \
+  --output results/candidates_k6/candidate_metrics.csv
+```
+
+### Environment Setup
+
+Use these commands to create the environment:
+
+```bash
+conda env create -f environment.yml
+conda activate alpamayo-r1-research
+python -m pip install --no-build-isolation -r requirements/flash-attn.txt
+python -m pip install --no-deps -r requirements/alpamayo-source.txt
+python -m unittest discover -s tests -v
+```
+
+The separate installation of `flash-attn` is necessary. The build process requires an installed version of Torch.
+
+### SLURM Operation
+
+Use one visible GPU for each task. Use a zero-based SLURM array to process multiple clips.
+
+Do not use the same shard index and output directory for concurrent tasks.
+
+Use this command for a short test:
+
+```bash
+mkdir -p logs
+export ALPAMAYO_PYTHON="$CONDA_PREFIX/bin/python"
+export PARTITION=<gpu-partition>
+NUM_CANDIDATES=1 MAX_CLIPS=1 sbatch --partition="$PARTITION" --array=0-0 \
+  --output=logs/%x-%A_%a.out \
+  slurm/run_generate_candidates.sh
+```
+
+Remove the `NUM_CANDIDATES` and `MAX_CLIPS` values for a full run. Select an array size that is correct for the cluster capacity.
+
+Use `hf auth login` one time before an online run. As an alternative, use the scheduler secret system to supply `HF_TOKEN`.
+
+Set `HF_HUB_OFFLINE=1` only when the cache contains all required files.
+
+The SLURM script checks these conditions before model load:
+
+- The project path is available.
+- The clip file is available.
+- The Python and package versions are correct.
+- The Hugging Face credentials are available for an online run.
+- The task has exactly one visible GPU.
+
+The script accepts these optional environment variables:
+
+- `ALPAMAYO_PROJECT_ROOT`
+- `CLIP_PARQUET`
+- `OUTPUT_DIR`
+- `GPU_MEMORY`
+- `CPU_MEMORY`
+
+The process resumes only when an existing artifact has the correct configuration and identity. Set `OVERWRITE=1` to replace an incompatible artifact.
 
 ## References
 
-- Model card: https://huggingface.co/nvidia/Alpamayo-R1-10B
-- Dataset: https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicles
-- Alpamayo code: https://github.com/NVlabs/alpamayo
+- [Alpamayo-R1 model card](https://huggingface.co/nvidia/Alpamayo-R1-10B)
+- [PhysicalAI Autonomous Vehicles dataset](https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicles)
+- [Alpamayo source](https://github.com/NVlabs/alpamayo)
