@@ -37,6 +37,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--checkpoint", help="Required for method=learned")
     parser.add_argument("--output", required=True, help="Metrics JSON path")
+    parser.add_argument(
+        "--data-role",
+        choices=("test", "validation"),
+        default="test",
+        help="Test rejects train and validation overlap; validation must match the checkpoint validation set",
+    )
     parser.add_argument("--prediction-dir", help="Optional per-clip probability NPZ directory")
     parser.add_argument(
         "--overwrite-predictions",
@@ -115,6 +121,11 @@ def _validate_existing_prediction(
             or actual_probability.max(initial=1.0) > 1
         ):
             raise ValueError(f"Existing prediction {path} has invalid probabilities")
+        if not np.array_equal(actual_probability, expected_probability):
+            raise ValueError(
+                f"Existing prediction {path} has different occupancy_prob values; "
+                "use --overwrite-predictions to replace it"
+            )
         for key in metadata_keys:
             if not np.array_equal(np.asarray(archive[key]), expected[key]):
                 raise ValueError(
@@ -161,6 +172,22 @@ def main() -> None:
             left_name="Checkpoint training data",
             right_name="evaluation data",
         )
+        if "val" not in checkpoint_provenance:
+            raise ValueError("Checkpoint has no validation-data provenance")
+        if args.data_role == "test":
+            reject_chunk_overlap(
+                checkpoint_provenance["val"],
+                evaluation_provenance,
+                left_name="Checkpoint validation data",
+                right_name="evaluation data",
+            )
+        elif (
+            evaluation_provenance["dataset_fingerprint"]
+            != checkpoint_provenance["val"].get("dataset_fingerprint")
+        ):
+            raise ValueError(
+                "Validation evaluation data does not match checkpoint validation data"
+            )
         model = TemporalOccupancyNet(ModelConfig(**checkpoint["model_config"]))
         model.load_state_dict(checkpoint["model_state"])
         model.to(device).eval()
@@ -191,6 +218,7 @@ def main() -> None:
     )
     prediction_run = {
         "method": args.method,
+        "data_role": args.data_role,
         "checkpoint_sha256": checkpoint_sha256,
         "amp": bool(args.amp and device.type == "cuda"),
         "data_schema": {
@@ -234,6 +262,7 @@ def main() -> None:
 
     result = {
         "method": args.method,
+        "data_role": args.data_role,
         "manifest": str(Path(args.manifest).resolve()),
         "checkpoint": str(Path(args.checkpoint).resolve()) if args.checkpoint else None,
         "checkpoint_epoch": checkpoint_epoch,

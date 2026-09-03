@@ -316,7 +316,7 @@ The tool does these operations:
 5. Calculate collision, clearance, observed-space, and out-of-bounds values.
 6. Make an evaluation rank for the candidates.
 
-The tool treats unobserved space and out-of-bounds space as unknown. A candidate cannot get the best rank because it moves through unknown space.
+The tool treats unobserved space and out-of-bounds space as unknown. A candidate with unknown exposure ranks after each fully observed, in-bounds candidate.
 
 The oracle is not an interactive simulator. Other road users follow the recorded ego action and do not react to the trajectory candidates.
 
@@ -329,7 +329,7 @@ The world model uses past BEV grids to calculate future occupancy probabilities.
 The world-model process has these parts:
 
 - Dataset groups that do not share a LiDAR source chunk
-- Checkpoints that support an exact restart
+- Checkpoints that validate and restore the state at an epoch boundary
 - A persistence baseline
 - Metrics that use only observed cells
 - Output files that identify all source files

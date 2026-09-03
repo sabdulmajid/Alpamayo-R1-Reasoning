@@ -164,6 +164,60 @@ class SyntheticPipelineTest(unittest.TestCase):
                 self.assertEqual(int(archive["schema_version"]), 2)
                 self.assertEqual(len(str(archive["prediction_run_fingerprint"])), 64)
 
+            with np.load(prediction, allow_pickle=False) as archive:
+                prediction_arrays = {name: archive[name] for name in archive.files}
+            prediction_arrays["occupancy_prob"] = prediction_arrays[
+                "occupancy_prob"
+            ].copy()
+            original_probability = float(prediction_arrays["occupancy_prob"].flat[0])
+            prediction_arrays["occupancy_prob"].flat[0] = (
+                1.0 if original_probability < 0.5 else 0.0
+            )
+            np.savez_compressed(prediction, **prediction_arrays)
+            with self.assertRaises(subprocess.CalledProcessError) as stale_error:
+                run_module(
+                    "-m",
+                    "src.world_model.evaluate",
+                    "--manifest",
+                    str(manifests["test"]),
+                    "--method",
+                    "learned",
+                    "--checkpoint",
+                    str(output_dir / "latest.pt"),
+                    "--output",
+                    str(root / "stale.json"),
+                    "--prediction-dir",
+                    str(prediction_dir),
+                    "--batch-size",
+                    "1",
+                    "--workers",
+                    "0",
+                    "--device",
+                    "cpu",
+                )
+            self.assertIn("different occupancy_prob values", stale_error.exception.stderr)
+            run_module(
+                "-m",
+                "src.world_model.evaluate",
+                "--manifest",
+                str(manifests["test"]),
+                "--method",
+                "learned",
+                "--checkpoint",
+                str(output_dir / "latest.pt"),
+                "--output",
+                str(learned_metrics),
+                "--prediction-dir",
+                str(prediction_dir),
+                "--overwrite-predictions",
+                "--batch-size",
+                "1",
+                "--workers",
+                "0",
+                "--device",
+                "cpu",
+            )
+
             persistence_metrics = root / "persistence.json"
             run_module(
                 "-m",
@@ -220,6 +274,49 @@ class SyntheticPipelineTest(unittest.TestCase):
                     "cpu",
                 )
             self.assertIn("share source chunks", overlap_error.exception.stderr)
+
+            with self.assertRaises(subprocess.CalledProcessError) as val_overlap_error:
+                run_module(
+                    "-m",
+                    "src.world_model.evaluate",
+                    "--manifest",
+                    str(manifests["val"]),
+                    "--method",
+                    "learned",
+                    "--checkpoint",
+                    str(output_dir / "latest.pt"),
+                    "--output",
+                    str(root / "invalid-val-overlap.json"),
+                    "--workers",
+                    "0",
+                    "--device",
+                    "cpu",
+                )
+            self.assertIn("share source chunks", val_overlap_error.exception.stderr)
+
+            validation_metrics = root / "validation.json"
+            run_module(
+                "-m",
+                "src.world_model.evaluate",
+                "--manifest",
+                str(manifests["val"]),
+                "--method",
+                "learned",
+                "--data-role",
+                "validation",
+                "--checkpoint",
+                str(output_dir / "latest.pt"),
+                "--output",
+                str(validation_metrics),
+                "--workers",
+                "0",
+                "--device",
+                "cpu",
+            )
+            validation_result = json.loads(
+                validation_metrics.read_text(encoding="utf-8")
+            )
+            self.assertEqual(validation_result["data_role"], "validation")
 
             train_artifact = root / "train.npz"
             with np.load(train_artifact, allow_pickle=False) as archive:

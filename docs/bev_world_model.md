@@ -92,9 +92,9 @@ python -m src.world_model.evaluate \
   --output results/world_model/persistence_test.json
 ```
 
-Metrics are visibility-masked IoU, precision, recall, histogram AUPRC, and Brier
-score per horizon and as an unweighted horizon mean. Prediction filenames use a
-SHA-256 identity digest. Each atomically written NPZ embeds clip identity,
+Metrics are visibility-masked IoU, precision, recall, histogram average
+precision, and Brier score per horizon and as an unweighted horizon mean.
+Prediction filenames use a SHA-256 identity digest. Each atomically written NPZ embeds clip identity,
 geometry, producer method, source-artifact hash, checkpoint hash, and canonical
 run fingerprint. Existing predictions are accepted only when those fields
 match; use `--overwrite-predictions` for an intentional replacement. Learned
@@ -117,10 +117,12 @@ and BEV geometry. It does not load `occupancy`, `observed`, oracle ranks, or
 output contains no oracle choice. It records the selected index, component
 scores, prediction provenance, resolved input paths, and SHA-256 hashes.
 
-The score combines swept-footprint collision probability, predictive entropy,
-out-of-bounds exposure, acceleration, jerk, curvature, and progress. Fix weights
-on validation data before evaluating a held-out test set. Recorded-future risk
-and ADE comparisons must be joined after selection in a separate evaluator.
+The score samples the vehicle footprint at the six forecast horizons. It combines
+an independent-horizon collision-risk proxy, predictive entropy, out-of-bounds
+exposure, acceleration, jerk, curvature, and progress. The risk proxy is not a
+calibrated collision probability. Fix weights on validation data before you
+evaluate a held-out test set. Join recorded-future risk and ADE after selection
+in a separate evaluator.
 
 ## SLURM
 
@@ -148,7 +150,8 @@ resume. The scripts fail before training if input paths or CUDA are unavailable.
 Scale beyond a smoke run only if:
 
 1. 100 oracle artifacts load with no identity, geometry, or schema failure.
-2. Learned IoU and AUPRC exceed persistence at short horizons and Brier is lower.
+2. Learned IoU and average precision exceed persistence at short horizons and
+   Brier score is lower.
 3. Candidate diversity is sufficient for selection to change outcomes.
 4. On held-out clips, selection reduces recorded-future collision exposure by at
    least 15% relative to candidate zero.

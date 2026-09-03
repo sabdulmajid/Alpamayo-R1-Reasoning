@@ -94,6 +94,12 @@ def trajectory_comfort(xy: np.ndarray, times_s: np.ndarray) -> dict[str, float]:
     delta_t = np.diff(times_s)
     if np.any(delta_t <= 0):
         raise ValueError("candidate_times_s must be strictly increasing")
+    if times_s[0] < 0:
+        raise ValueError("candidate_times_s cannot start before zero")
+    if times_s[0] > 0:
+        xy = np.concatenate((np.zeros((1, 2), dtype=xy.dtype), xy), axis=0)
+        times_s = np.concatenate((np.zeros(1, dtype=times_s.dtype), times_s))
+        delta_t = np.diff(times_s)
     velocity = np.diff(xy, axis=0) / delta_t[:, None]
     speed = np.linalg.norm(velocity, axis=1)
     if velocity.shape[0] > 1:
@@ -175,12 +181,12 @@ def score_candidate(
             clipped = np.clip(probabilities, 1e-6, 1 - 1e-6)
             entropy = -(clipped * np.log(clipped) + (1 - clipped) * np.log(1 - clipped)) / np.log(2)
             horizon_uncertainty[horizon_index] = float(entropy.mean())
-    collision_probability = float(1.0 - np.prod(1.0 - horizon_risk))
+    collision_risk_proxy = float(1.0 - np.prod(1.0 - horizon_risk))
     uncertainty = float(np.mean(horizon_uncertainty))
     out_of_bounds = float(np.mean(horizon_oob))
     comfort = trajectory_comfort(candidate_xy, candidate_times_s)
     total = (
-        weights.collision * collision_probability
+        weights.collision * collision_risk_proxy
         + weights.uncertainty * uncertainty
         + weights.out_of_bounds * out_of_bounds
         + weights.acceleration * comfort["mean_acceleration_mps2"]
@@ -190,7 +196,7 @@ def score_candidate(
     )
     return {
         "score": float(total),
-        "collision_probability": collision_probability,
+        "collision_risk_proxy": collision_risk_proxy,
         "uncertainty": uncertainty,
         "out_of_bounds_fraction": out_of_bounds,
         **comfort,

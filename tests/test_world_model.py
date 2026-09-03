@@ -17,7 +17,7 @@ from src.world_model.data import (
 from src.world_model.losses import occupancy_loss
 from src.world_model.metrics import OccupancyMetricAccumulator
 from src.world_model.model import ModelConfig, TemporalOccupancyNet
-from src.world_model.rerank import RerankWeights, rerank_artifacts
+from src.world_model.rerank import RerankWeights, rerank_artifacts, trajectory_comfort
 from src.world_model.runtime import sha256_file
 from src.world_model.split_manifest import split_rows
 
@@ -188,6 +188,7 @@ class ModelAndMetricTest(unittest.TestCase):
         metrics = accumulator.compute([1.0])
         self.assertEqual(metrics["per_horizon"][0]["valid_cells"], 3)
         self.assertAlmostEqual(metrics["mean"]["iou"], 1.0)
+        self.assertAlmostEqual(metrics["mean"]["average_precision"], 1.0)
         self.assertAlmostEqual(metrics["mean"]["brier"], 0.0)
 
     def test_persistence_baselines_identity(self) -> None:
@@ -204,6 +205,13 @@ class ModelAndMetricTest(unittest.TestCase):
 
 
 class RerankerTest(unittest.TestCase):
+    def test_comfort_includes_origin_before_first_positive_sample(self) -> None:
+        xy = np.array([[1.0, 0.0], [2.0, 0.0]], dtype=np.float32)
+        times = np.array([1.0, 2.0], dtype=np.float32)
+        metrics = trajectory_comfort(xy, times)
+        self.assertAlmostEqual(metrics["mean_speed_mps"], 1.0)
+        self.assertAlmostEqual(metrics["progress_m"], 2.0)
+
     def test_predicted_occupancy_changes_selection_without_oracle_access(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
