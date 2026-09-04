@@ -333,11 +333,97 @@ The world-model process has these parts:
 - A persistence baseline
 - Metrics that use only observed cells
 - Output files that identify all source files
-- SLURM scripts that use one GPU
+- Two parallel SLURM training jobs
+
+Each training job uses one GPU.
 
 The candidate selector uses only predicted occupancy and trajectory data. It does not use the recorded-future occupancy or the oracle rank.
 
-The repository does not contain a trained result. The acceptance limits in the implementation guide are test requirements, not results.
+### Final World-Model Benchmark
+
+The final benchmark completed all stages. It used 2,000 clips and six trajectory candidates for each clip. The frozen split used 1,612 training clips, 180 validation clips, and 208 test clips. The split unit was the LiDAR source chunk. The test set contained 67 source chunks. No source chunk was in more than one split.
+
+The benchmark gave two different results:
+
+1. The learned model predicted future occupancy better than the persistence baseline.
+2. The current reranker did not improve candidate selection relative to candidate 0.
+
+The forecast test passed all three acceptance limits. The candidate-selection test passed one of five acceptance limits. Therefore, the complete benchmark did not pass.
+
+#### GPU and SLURM Use
+
+The LiDAR-oracle stage used a CPU array with eight tasks and a concurrency limit of eight. Each task requested 3 CPUs and 7 GiB of memory. This stage did not use a GPU.
+
+The training stage used two NVIDIA RTX A4500 GPUs on node `ece-nebula10` in the `dualcard` partition. The two seed jobs ran at the same time. Each job requested one GPU, 4 CPUs, and 28 GiB of host memory. Each job completed 30 epochs in less than eight minutes. The learned evaluation used one A4500. The other evaluation stages used CPUs.
+
+All jobs from data preparation through final evaluation completed with exit code 0. All ten downstream error logs were empty. No CUDA error or out-of-memory error occurred. The run produced 208 learned predictions and 208 persistence predictions.
+
+The validation loss selected seed 2027 at epoch 16. The selected validation loss was 0.49432. The test metrics did not take part in checkpoint selection.
+
+#### Occupancy Forecast Result
+
+The primary forecast result uses the 0.5-second, 1-second, and 2-second horizons. The test first calculates each metric for each clip. It then calculates the mean of the clip values. A positive difference is better for average precision and intersection over union (IoU). A negative difference is better for Brier score.
+
+| Metric | Learned model | Persistence | Learned minus persistence | Paired 95 percent interval | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Average precision | 0.81543 | 0.59847 | +0.21696 | +0.20922 to +0.22485 | Pass |
+| Brier score | 0.09813 | 0.12401 | -0.02589 | -0.03008 to -0.02189 | Pass |
+| IoU at a 0.5 threshold | 0.59933 | 0.56072 | +0.03861 | +0.03033 to +0.04664 | Pass |
+
+All three intervals exclude zero in the required direction. The learned model also gave better mean results at each tested horizon from 0.5 seconds through 6 seconds. Thus, the learned model improved occupancy prediction under this protocol.
+
+#### Candidate-Selection Result
+
+The reranker used each occupancy forecast to select one of six trajectory candidates. Candidate 0 is the baseline trajectory from the original ordered candidate set. Collision exposure is the fraction of observed vehicle-footprint cells that contain recorded LiDAR endpoints. It is not a collision probability.
+
+| Policy | Collision exposure | Clips with a recorded conflict | ADE | Out-of-bounds fraction | Observed fraction |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Candidate 0 | 0.03199 | 30.29 percent | 1.8436 m | 0.10096 | 1.00000 |
+| Learned selection | 0.03868 | 34.13 percent | 2.3110 m | 0.10176 | 0.99982 |
+| Persistence selection | 0.04436 | 36.06 percent | 2.3549 m | 0.09535 | 0.99982 |
+| Recorded-future oracle | 0.01685 | 16.83 percent | 1.7311 m | 0.09135 | 1.00000 |
+
+The learned reranker reduced collision exposure by 0.00569 relative to the persistence reranker. The paired 95 percent interval was -0.01191 to -0.00043. However, the learned reranker increased collision exposure by 20.89 percent relative to candidate 0. The paired difference was +0.00668. Its interval was -0.00355 to +0.01779 and included zero.
+
+The learned reranker also increased average displacement error (ADE) by 0.4673 m relative to candidate 0. The paired 95 percent interval was 0.1933 m to 0.7699 m.
+
+| Predeclared selection limit | Measured result | Result |
+| --- | --- | --- |
+| Reduce candidate-0 collision exposure by at least 15 percent | 20.89 percent increase | Fail |
+| Do not exceed persistence collision exposure | 0.03868 versus 0.04436 | Pass |
+| Keep the upper limit of the paired ADE interval at or below 0.2 m | 0.7699 m | Fail |
+| Do not increase the out-of-bounds fraction | 0.10176 versus 0.10096 | Fail |
+| Do not decrease the observed fraction | 0.99982 versus 1.00000 | Fail |
+
+The learned reranker changed candidate 0 in 84.13 percent of the test clips. Its agreement with the recorded-future oracle was 20.67 percent. The recorded-future oracle found candidates with lower exposure than candidate 0. It reduced mean collision exposure from 0.03199 to 0.01685 on the test split. Therefore, the negative result applies to the current reranker. It does not show that the candidate set has no useful alternatives.
+
+#### Uncertainty Scope
+
+The intervals use 10,000 paired bootstrap samples. Each sample resamples the 67 LiDAR source chunks and keeps all clips from each selected chunk together. The intervals cover held-out source-chunk sampling. They do not cover variation from training seeds after checkpoint selection. The predeclared forecast gates use point estimates. The intervals describe uncertainty and do not decide the gates.
+
+#### Finite-BEV Limit
+
+The bird's-eye-view (BEV) grid covers -20 m to 80 m in the longitudinal direction. It covers -40 m to 40 m in the lateral direction. The resolution is 0.5 m. Long trajectories can leave this finite grid.
+
+In the full 2,000-clip pool, the candidate-0 footprint had at least one point outside the grid in 745 clips at 6 seconds. This value is 37.25 percent of the pool. Every candidate had at least one footprint point outside the grid in 648 clips, or 32.4 percent. Every candidate had no in-grid footprint cells in 590 clips, or 29.5 percent.
+
+Report out-of-bounds values separately from observed-space coverage. A trajectory with no in-grid footprint cells does not reduce the observed fraction. Thus, a high observed fraction does not remove the finite-grid limit.
+
+The dataset does not supply a timestamp for each LiDAR point. The oracle uses the reference timestamp for each LiDAR spin. This method cannot correct motion within one spin.
+
+The LiDAR oracle is a recorded-future replay test. It does not simulate how other road users respond to a different ego trajectory. Therefore, collision exposure is not a causal or closed-loop collision-risk estimate.
+
+#### Engineering Conclusion
+
+Keep the learned occupancy model. Do not use the current reranker as evidence of improved trajectory selection.
+
+The next change must target the selection policy. Use only validation data to calibrate the score scales and the selection threshold. Add a candidate-0 fallback. Permit a candidate change only when the predicted collision benefit exceeds a margin that the validation procedure sets before the next test. Do not permit a higher out-of-bounds fraction or a lower observed fraction.
+
+The current test split has now been used. Freeze the next policy before evaluation. Then use a new, untouched source-chunk test split for final confirmation.
+
+For long-horizon selection, increase or recenter the BEV extent. If the grid does not change, limit the selection claim to horizons with sufficient coverage.
+
+The machine-readable report contains the full-precision values and the artifact hashes. Read [`reports/world_model_benchmark_2k.json`](reports/world_model_benchmark_2k.json) for this report.
 
 Read [`docs/bev_world_model.md`](docs/bev_world_model.md) for the data contract, commands, metrics, and acceptance limits.
 
