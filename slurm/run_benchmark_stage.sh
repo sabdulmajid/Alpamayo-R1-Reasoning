@@ -26,6 +26,7 @@ EPOCHS=${BENCHMARK_EPOCHS:-30}
 BATCH_SIZE=${BENCHMARK_BATCH_SIZE:-4}
 WORKERS=${BENCHMARK_WORKERS:-4}
 BASE_CHANNELS=${BENCHMARK_BASE_CHANNELS:-16}
+EXPECTED_REPOSITORY_COMMIT=${BENCHMARK_REPOSITORY_COMMIT:?Set BENCHMARK_REPOSITORY_COMMIT}
 
 MERGED_MANIFEST=${RUN_DIR}/manifests/all.jsonl
 MERGE_SUMMARY=${RUN_DIR}/manifests/merge_summary.json
@@ -42,6 +43,23 @@ if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
 fi
 if [[ ! -d "${REPO_ROOT}" ]]; then
     echo "ERROR: repository does not exist: ${REPO_ROOT}" >&2
+    exit 2
+fi
+if [[ ! "${EXPECTED_REPOSITORY_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ERROR: BENCHMARK_REPOSITORY_COMMIT must be a full lowercase Git commit" >&2
+    exit 2
+fi
+if ! command -v git >/dev/null 2>&1; then
+    echo "ERROR: git is unavailable; cannot verify benchmark source" >&2
+    exit 2
+fi
+ACTUAL_REPOSITORY_COMMIT=$(git -C "${REPO_ROOT}" rev-parse --verify HEAD^{commit})
+if [[ "${ACTUAL_REPOSITORY_COMMIT}" != "${EXPECTED_REPOSITORY_COMMIT}" ]]; then
+    echo "ERROR: repository HEAD ${ACTUAL_REPOSITORY_COMMIT} does not match expected commit ${EXPECTED_REPOSITORY_COMMIT}" >&2
+    exit 2
+fi
+if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=all)" ]]; then
+    echo "ERROR: repository worktree is dirty: ${REPO_ROOT}" >&2
     exit 2
 fi
 mkdir -p "${RUN_DIR}"
@@ -94,6 +112,14 @@ PY
 }
 
 case "${ACTION}" in
+    oracle)
+        export PROJECT_DIR="${REPO_ROOT}"
+        export PYTHON_BIN
+        export CLIP_PARQUET
+        export CANDIDATE_DIR
+        export OUTPUT_DIR="${ORACLE_DIR}"
+        exec "${REPO_ROOT}/slurm/build_lidar_world_oracle.sh"
+        ;;
     prepare)
         require_file "${CANDIDATE_DIR}/records"
         require_file "${ORACLE_DIR}/manifests/shard-00000-of-$(printf '%05d' "${EXPECTED_SHARDS}").jsonl"
