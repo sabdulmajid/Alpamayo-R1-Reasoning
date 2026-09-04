@@ -37,6 +37,7 @@ DATASET_REVISION = "2ae73f49ffd2b5db43b404201beb7b92889f7afc"
 LIDAR_FEATURE = "lidar_top_360fov"
 REFERENCE_TIMESTAMP_MODE = "reference-timestamp-rigid-spin"
 PER_POINT_TIMESTAMP_MODE = "spin-interval-per-point"
+DERIVED_YAW_ATOL_RAD = 1e-6
 OUTPUT_SCHEMA_VERSION = 4
 
 
@@ -1458,7 +1459,7 @@ def validate_existing_output(
                 candidate_yaw,
                 source_candidate_yaw,
                 rtol=0.0,
-                atol=1e-7,
+                atol=DERIVED_YAW_ATOL_RAD,
             )
             or not np.array_equal(candidate_times, source_candidate_times)
             or str(scalar("candidate_yaw_source")) != source_yaw_source

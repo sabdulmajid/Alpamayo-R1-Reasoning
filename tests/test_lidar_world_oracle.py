@@ -415,22 +415,42 @@ class SerializationTests(unittest.TestCase):
             )
             self.assertTrue(resumed["resumed"])
 
-            rounded = dict(arrays)
-            rounded["candidate_yaw"] = rounded["candidate_yaw"].copy()
-            rounded["candidate_yaw"][0, 0] = np.nextafter(
-                rounded["candidate_yaw"][0, 0], np.float32(np.inf)
-            )
-            atomic_save_npz(path, rounded)
-            self.assertTrue(
-                validate_existing_output(
-                    path,
-                    "clip",
-                    1_000_000,
-                    "revision",
-                    oracle_config,
-                    candidate_ref,
-                )["resumed"]
-            )
+            for yaw_delta, accepted in ((5e-7, True), (2e-6, False)):
+                source_yaw = candidate_yaw.copy()
+                source_yaw[0, 0] += np.float32(yaw_delta)
+                source_geometry = (
+                    candidate_xyz,
+                    source_yaw,
+                    candidate_times,
+                    "pred_yaw",
+                )
+                with mock.patch(
+                    "src.lidar_world_oracle.load_candidate_geometry",
+                    return_value=source_geometry,
+                ):
+                    if accepted:
+                        self.assertTrue(
+                            validate_existing_output(
+                                path,
+                                "clip",
+                                1_000_000,
+                                "revision",
+                                oracle_config,
+                                candidate_ref,
+                            )["resumed"]
+                        )
+                    else:
+                        with self.assertRaisesRegex(
+                            ValueError, "candidate geometry"
+                        ):
+                            validate_existing_output(
+                                path,
+                                "clip",
+                                1_000_000,
+                                "revision",
+                                oracle_config,
+                                candidate_ref,
+                            )
 
             changed = dict(oracle_config)
             changed["history_offsets_s"] = [-0.5, 0.0]

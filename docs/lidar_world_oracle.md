@@ -8,29 +8,26 @@ world-aware reranking. It is not used as planner input at inference time.
 
 Every output grid and trajectory uses the ego rig frame at `t0`: x points
 forward, y points left, and z points up. PhysicalAI-AV supplies sensor-to-rig
-extrinsics and timestamped rig-to-world egomotion. Each LiDAR return uses its
-absolute per-point timestamp:
+extrinsics and timestamped rig-to-world egomotion. The pinned source supplies
+one reference timestamp for each LiDAR spin:
 
 ```text
 p_ego@t0 = inv(T_world_rig(t0))
-             @ T_world_rig(point_timestamp)
+             @ T_world_rig(spin_reference_timestamp)
              @ T_rig_lidar
              @ p_lidar
 ```
 
-This compensates both the motion between spins and motion during a spin. The
-implementation follows the PhysicalAI-AV transform direction and Draco fields
-used by NVIDIA's
-[NCore PAI converter](https://github.com/NVIDIA/ncore/blob/main/tools/data_converter/pai/converter.py).
+This compensates motion between spins. The pinned source does not supply
+per-point timestamps, so the oracle cannot compensate motion during a spin.
 
 ## Occupancy construction
 
 The builder samples history at `[-1.0, -0.5, 0.0]` seconds by default and future
 targets at `[0.5, 1.0, 2.0, 3.0, 4.0, 6.0]` seconds. Both can be changed with
-`--history-offsets` and `--horizons`. The nearest LiDAR spin midpoint must fall
-within `--spin-tolerance` (0.2 s by default). The decoder reads Draco xyz and
-the absolute per-point `timestamp` attribute. For every history and future spin
-it then:
+`--history-offsets` and `--horizons`. The nearest LiDAR reference timestamp must
+fall within `--spin-tolerance` (0.2 s by default). The decoder reads Draco xyz.
+For every history and future spin, it then:
 
 1. transforms returns into `ego_at_t0`;
 2. removes returns inside the padded vehicle bounding box using the dataset's
