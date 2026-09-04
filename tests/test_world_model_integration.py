@@ -9,6 +9,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from src.world_model.benchmark_prep import verify_evaluation_partition
+from src.world_model.runtime import canonical_fingerprint, sha256_file
+
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 
@@ -60,6 +63,66 @@ def write_example(path: Path, clip_id: str, t0_us: int, occupied_y: int) -> None
         bev_y_max_m=np.float32(6.0),
         bev_resolution_m=np.float32(1.0),
     )
+
+
+def write_evaluation_binding(
+    root: Path, checkpoint_path: Path, test_manifest: Path
+) -> tuple[Path, Path]:
+    checkpoint_path = checkpoint_path.resolve()
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    checkpoint_sha256 = sha256_file(checkpoint_path)
+    signature = checkpoint["resume_signature"]
+    provenance = checkpoint["data_provenance"]
+    selected_run = {
+        "label": "seed-selected",
+        "run_directory": str(checkpoint_path.parent),
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_sha256": checkpoint_sha256,
+        "epoch": int(checkpoint["epoch"]),
+        "seed": int(checkpoint["seed"]),
+        "best_validation_loss": float(checkpoint["best_val_loss"]),
+        "train_manifest_sha256": signature["train_manifest_sha256"],
+        "validation_manifest_sha256": signature["val_manifest_sha256"],
+        "train_dataset_fingerprint": provenance["train"]["dataset_fingerprint"],
+        "validation_dataset_fingerprint": provenance["val"]["dataset_fingerprint"],
+        "model_config": checkpoint["model_config"],
+        "data_schema": checkpoint["data_schema"],
+        "comparison_signature": {
+            key: value for key, value in signature.items() if key != "seed"
+        },
+    }
+    other_run = {
+        **selected_run,
+        "label": "seed-other",
+        "checkpoint": str((root / "other-best.pt").resolve()),
+        "checkpoint_sha256": "a" * 64,
+        "seed": int(checkpoint["seed"]) + 1,
+        "best_validation_loss": float(checkpoint["best_val_loss"]) + 1.0,
+    }
+    selection = {
+        "schema_version": 1,
+        "selection_policy": "minimum_best_validation_loss",
+        "test_metrics_used": False,
+        "selected_label": selected_run["label"],
+        "selected_seed": selected_run["seed"],
+        "selected_checkpoint": selected_run["checkpoint"],
+        "selected_checkpoint_sha256": selected_run["checkpoint_sha256"],
+        "selected_epoch": selected_run["epoch"],
+        "selected_validation_loss": selected_run["best_validation_loss"],
+        "runs": [selected_run, other_run],
+    }
+    selection["selection_fingerprint"] = canonical_fingerprint(selection)
+    selection_path = root / "checkpoint_selection.json"
+    selection_path.write_text(
+        json.dumps(selection, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    audit = verify_evaluation_partition(selection_path, test_manifest)
+    audit["selection_fingerprint"] = selection["selection_fingerprint"]
+    audit_path = root / "evaluation_partition.json"
+    audit_path.write_text(
+        json.dumps(audit, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return selection_path, audit_path
 
 
 class SyntheticPipelineTest(unittest.TestCase):
@@ -116,7 +179,9 @@ class SyntheticPipelineTest(unittest.TestCase):
             self.assertIn("share source chunks", split_error.exception.stderr)
 
             run_module(*common_train, "--epochs", "1")
-            first = torch.load(output_dir / "latest.pt", map_location="cpu", weights_only=False)
+            first = torch.load(
+                output_dir / "latest.pt", map_location="cpu", weights_only=False
+            )
             self.assertEqual(first["epoch"], 0)
             self.assertIn("scaler_state", first)
             self.assertIn("rng_state", first)
@@ -135,6 +200,32 @@ class SyntheticPipelineTest(unittest.TestCase):
 
             prediction_dir = root / "predictions"
             learned_metrics = root / "learned.json"
+            selection_record, evaluation_audit = write_evaluation_binding(
+                root, output_dir / "latest.pt", manifests["test"]
+            )
+            learned_binding_arguments = (
+                "--selection-record",
+                str(selection_record),
+                "--evaluation-audit",
+                str(evaluation_audit),
+            )
+            with self.assertRaises(subprocess.CalledProcessError) as binding_error:
+                run_module(
+                    "-m",
+                    "src.world_model.evaluate",
+                    "--manifest",
+                    str(manifests["test"]),
+                    "--method",
+                    "learned",
+                    "--checkpoint",
+                    str(output_dir / "latest.pt"),
+                    "--output",
+                    str(root / "unbound.json"),
+                )
+            self.assertIn(
+                "requires --selection-record and --evaluation-audit",
+                binding_error.exception.stderr,
+            )
             run_module(
                 "-m",
                 "src.world_model.evaluate",
@@ -144,6 +235,7 @@ class SyntheticPipelineTest(unittest.TestCase):
                 "learned",
                 "--checkpoint",
                 str(output_dir / "latest.pt"),
+                *learned_binding_arguments,
                 "--output",
                 str(learned_metrics),
                 "--prediction-dir",
@@ -163,6 +255,46 @@ class SyntheticPipelineTest(unittest.TestCase):
                 self.assertEqual(str(archive["producer_method"]), "learned")
                 self.assertEqual(int(archive["schema_version"]), 2)
                 self.assertEqual(len(str(archive["prediction_run_fingerprint"])), 64)
+                prediction_run = json.loads(str(archive["prediction_run_json"]))
+                binding = prediction_run["evaluation_binding"]
+                self.assertEqual(
+                    binding["checkpoint_selection"]["sha256"],
+                    sha256_file(selection_record),
+                )
+                self.assertEqual(
+                    binding["evaluation_audit"]["sha256"],
+                    sha256_file(evaluation_audit),
+                )
+
+            audit_bytes = evaluation_audit.read_bytes()
+            audit_payload = json.loads(audit_bytes)
+            evaluation_audit.write_text(
+                json.dumps(audit_payload, sort_keys=True), encoding="utf-8"
+            )
+            with self.assertRaises(subprocess.CalledProcessError) as record_error:
+                run_module(
+                    "-m",
+                    "src.world_model.evaluate",
+                    "--manifest",
+                    str(manifests["test"]),
+                    "--method",
+                    "learned",
+                    "--checkpoint",
+                    str(output_dir / "latest.pt"),
+                    *learned_binding_arguments,
+                    "--output",
+                    str(root / "changed-record.json"),
+                    "--prediction-dir",
+                    str(prediction_dir),
+                    "--batch-size",
+                    "1",
+                    "--workers",
+                    "0",
+                    "--device",
+                    "cpu",
+                )
+            self.assertIn("different prediction_run", record_error.exception.stderr)
+            evaluation_audit.write_bytes(audit_bytes)
 
             with np.load(prediction, allow_pickle=False) as archive:
                 prediction_arrays = {name: archive[name] for name in archive.files}
@@ -184,6 +316,7 @@ class SyntheticPipelineTest(unittest.TestCase):
                     "learned",
                     "--checkpoint",
                     str(output_dir / "latest.pt"),
+                    *learned_binding_arguments,
                     "--output",
                     str(root / "stale.json"),
                     "--prediction-dir",
@@ -195,7 +328,9 @@ class SyntheticPipelineTest(unittest.TestCase):
                     "--device",
                     "cpu",
                 )
-            self.assertIn("different occupancy_prob values", stale_error.exception.stderr)
+            self.assertIn(
+                "different occupancy_prob values", stale_error.exception.stderr
+            )
             run_module(
                 "-m",
                 "src.world_model.evaluate",
@@ -205,6 +340,7 @@ class SyntheticPipelineTest(unittest.TestCase):
                 "learned",
                 "--checkpoint",
                 str(output_dir / "latest.pt"),
+                *learned_binding_arguments,
                 "--output",
                 str(learned_metrics),
                 "--prediction-dir",
@@ -238,6 +374,9 @@ class SyntheticPipelineTest(unittest.TestCase):
             baseline = json.loads(persistence_metrics.read_text(encoding="utf-8"))
             self.assertEqual(baseline["method"], "persistence")
             self.assertIsNone(baseline["checkpoint_sha256"])
+            self.assertIsNone(baseline["evaluation_binding"]["checkpoint"])
+            self.assertIsNone(baseline["evaluation_binding"]["checkpoint_selection"])
+            self.assertIsNone(baseline["evaluation_binding"]["evaluation_audit"])
 
             reranked_path = root / "reranked.jsonl"
             run_module(
@@ -266,6 +405,7 @@ class SyntheticPipelineTest(unittest.TestCase):
                     "learned",
                     "--checkpoint",
                     str(output_dir / "latest.pt"),
+                    *learned_binding_arguments,
                     "--output",
                     str(root / "invalid-overlap.json"),
                     "--workers",
@@ -285,6 +425,7 @@ class SyntheticPipelineTest(unittest.TestCase):
                     "learned",
                     "--checkpoint",
                     str(output_dir / "latest.pt"),
+                    *learned_binding_arguments,
                     "--output",
                     str(root / "invalid-val-overlap.json"),
                     "--workers",
