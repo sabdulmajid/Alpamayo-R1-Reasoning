@@ -1470,9 +1470,12 @@ def main() -> None:
         bootstrap_replicates=args.bootstrap_replicates,
         bootstrap_seed=args.bootstrap_seed,
     )
-    write_json(summary, args.output)
     if args.per_clip_output:
         write_jsonl(per_clip, args.per_clip_output)
+    # The summary is the completion marker for this two-file report. Write it
+    # only after the optional audit rows are durable, so an interrupted stage
+    # can safely replace an uncommitted audit file and try again.
+    write_json(summary, args.output)
     print(
         f"Evaluated {summary['evaluation']['clips']} held-out clips across "
         f"{summary['evaluation']['source_chunks']} source chunks"

@@ -2,12 +2,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
 from src.world_model.evaluate_selection import (
     cluster_bootstrap_interval,
     evaluate_selection,
+    main,
 )
 from src.world_model.runtime import canonical_fingerprint, sha256_file
 
@@ -603,6 +605,60 @@ class HeldOutSelectionEvaluationTest(unittest.TestCase):
             (fixture.candidate_dir / "records" / "clip-3.json").unlink()
             with self.assertRaisesRegex(ValueError, "missing test clips"):
                 fixture.evaluate()
+
+    def test_cli_writes_audit_rows_before_summary_completion_marker(self) -> None:
+        summary = {"evaluation": {"clips": 2, "source_chunks": 2}}
+        per_clip = [{"clip_id": "clip-0"}, {"clip_id": "clip-1"}]
+        events: list[tuple[str, object, str]] = []
+        argv = [
+            "evaluate_selection",
+            "--protocol",
+            "protocol.json",
+            "--test-manifest",
+            "test.jsonl",
+            "--train-manifest",
+            "train.jsonl",
+            "--validation-manifest",
+            "validation.jsonl",
+            "--oracle-manifest",
+            "oracle.jsonl",
+            "--learned-selections",
+            "learned.jsonl",
+            "--persistence-selections",
+            "persistence.jsonl",
+            "--candidate-dir",
+            "candidates",
+            "--output",
+            "summary.json",
+            "--per-clip-output",
+            "audit.jsonl",
+        ]
+        with (
+            mock.patch("sys.argv", argv),
+            mock.patch(
+                "src.world_model.evaluate_selection.evaluate_selection",
+                return_value=(summary, per_clip),
+            ),
+            mock.patch(
+                "src.world_model.evaluate_selection.write_jsonl",
+                side_effect=lambda rows, path: events.append(("jsonl", rows, path)),
+            ),
+            mock.patch(
+                "src.world_model.evaluate_selection.write_json",
+                side_effect=lambda payload, path: events.append(
+                    ("json", payload, path)
+                ),
+            ),
+        ):
+            main()
+
+        self.assertEqual(
+            events,
+            [
+                ("jsonl", per_clip, "audit.jsonl"),
+                ("json", summary, "summary.json"),
+            ],
+        )
 
 
 if __name__ == "__main__":

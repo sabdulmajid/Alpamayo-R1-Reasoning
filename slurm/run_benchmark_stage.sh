@@ -200,6 +200,8 @@ case "${ACTION}" in
             --method learned \
             --data-role test \
             --checkpoint "${CHECKPOINT}" \
+            --selection-record "${SELECTION}" \
+            --evaluation-audit "${EVALUATION_AUDIT}" \
             --output "${METRICS}" \
             --prediction-dir "${PREDICTIONS}" \
             --batch-size "${BATCH_SIZE}" \
@@ -253,6 +255,7 @@ case "${ACTION}" in
         OUTPUT=${RUN_DIR}/evaluation/forecast_comparison.json
         require_new_output "${OUTPUT}"
         srun --nodes=1 --ntasks=1 "${PYTHON_BIN}" -m src.world_model.compare_forecasts \
+            --protocol "${RUN_DIR}/protocol.json" \
             --manifest "${TEST_MANIFEST}" \
             --learned-prediction-dir "${RUN_DIR}/predictions/learned" \
             --persistence-prediction-dir "${RUN_DIR}/predictions/persistence" \
@@ -274,8 +277,9 @@ case "${ACTION}" in
         OUTPUT=${RUN_DIR}/evaluation/selection_test.json
         PER_CLIP_OUTPUT=${RUN_DIR}/evaluation/selection_test_per_clip.jsonl
         require_new_output "${OUTPUT}"
-        require_new_output "${PER_CLIP_OUTPUT}"
+        mkdir -p "$(dirname -- "${PER_CLIP_OUTPUT}")"
         srun --nodes=1 --ntasks=1 "${PYTHON_BIN}" -m src.world_model.evaluate_selection \
+            --protocol "${RUN_DIR}/protocol.json" \
             --test-manifest "${TEST_MANIFEST}" \
             --train-manifest "${TRAIN_MANIFEST}" \
             --validation-manifest "${VAL_MANIFEST}" \
