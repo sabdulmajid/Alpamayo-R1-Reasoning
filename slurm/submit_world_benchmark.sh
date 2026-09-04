@@ -8,6 +8,7 @@ REPO_ROOT=${BENCHMARK_REPO_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}
 PYTHON_BIN=${BENCHMARK_PYTHON:-python3}
 CANDIDATE_JOB_ID=${BENCHMARK_CANDIDATE_JOB_ID:-}
 EXISTING_ORACLE_JOB_ID=${BENCHMARK_ORACLE_JOB_ID:-}
+ORACLE_SUBMISSION_RECORD=${BENCHMARK_ORACLE_SUBMISSION_RECORD:-}
 CLIP_PARQUET=${BENCHMARK_CLIP_PARQUET:?Set BENCHMARK_CLIP_PARQUET}
 CANDIDATE_DIR=${BENCHMARK_CANDIDATE_DIR:?Set BENCHMARK_CANDIDATE_DIR}
 ORACLE_DIR=${BENCHMARK_ORACLE_DIR:?Set BENCHMARK_ORACLE_DIR}
@@ -23,6 +24,10 @@ ORACLE_MEMORY=${BENCHMARK_ORACLE_MEMORY:-24G}
 if [[ -n "${EXISTING_ORACLE_JOB_ID}" ]]; then
     if [[ ! "${EXISTING_ORACLE_JOB_ID}" =~ ^[0-9]+$ ]]; then
         echo "ERROR: BENCHMARK_ORACLE_JOB_ID must be one numeric SLURM job ID" >&2
+        exit 2
+    fi
+    if [[ -z "${ORACLE_SUBMISSION_RECORD}" ]]; then
+        echo "ERROR: set BENCHMARK_ORACLE_SUBMISSION_RECORD when reusing an oracle job" >&2
         exit 2
     fi
 elif [[ ! "${CANDIDATE_JOB_ID}" =~ ^[0-9]+$ ]]; then
@@ -66,6 +71,129 @@ if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain)" ]]; then
 fi
 REPOSITORY_COMMIT=$(git -C "${REPO_ROOT}" rev-parse --verify HEAD)
 STAGE_SCRIPT=${REPO_ROOT}/slurm/run_benchmark_stage.sh
+ORACLE_PROVENANCE_JSON=
+
+if [[ -n "${EXISTING_ORACLE_JOB_ID}" ]]; then
+    ORACLE_PROVENANCE_JSON=$("${PYTHON_BIN}" - \
+        "${ORACLE_SUBMISSION_RECORD}" \
+        "${EXISTING_ORACLE_JOB_ID}" \
+        "${CLIP_PARQUET}" \
+        "${CANDIDATE_DIR}" \
+        "${ORACLE_DIR}" <<'PY'
+import hashlib
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+
+try:
+    record_path = Path(sys.argv[1]).expanduser().resolve(strict=True)
+except (OSError, RuntimeError) as error:
+    raise SystemExit(f"ERROR: oracle submission record cannot be resolved: {error}") from error
+if not record_path.is_file():
+    raise SystemExit(f"ERROR: oracle submission record is not a file: {record_path}")
+try:
+    record_bytes = record_path.read_bytes()
+except OSError as error:
+    raise SystemExit(f"ERROR: oracle submission record cannot be read: {error}") from error
+try:
+    record = json.loads(record_bytes)
+except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise SystemExit(f"ERROR: invalid oracle submission record: {error}") from error
+if not isinstance(record, dict) or record.get("schema_version") != 2:
+    raise SystemExit("ERROR: oracle submission record must use schema_version 2")
+
+jobs = record.get("jobs")
+paths = record.get("paths")
+source = record.get("source")
+configuration = record.get("configuration")
+if not all(isinstance(value, dict) for value in (jobs, paths, source, configuration)):
+    raise SystemExit("ERROR: oracle submission record is missing required objects")
+if configuration.get("reused_oracle_job") is not False:
+    raise SystemExit("ERROR: oracle submission record must describe the original oracle job")
+
+expected_job = int(sys.argv[2])
+recorded_job = jobs.get("oracle_job")
+if isinstance(recorded_job, bool) or recorded_job != expected_job:
+    raise SystemExit(
+        f"ERROR: oracle submission record job {recorded_job!r} does not match {expected_job}"
+    )
+
+
+def canonical_record_path(name: str, *, directory: bool) -> Path:
+    value = paths.get(name)
+    if not isinstance(value, str) or not value:
+        raise SystemExit(f"ERROR: oracle submission record has invalid path {name!r}")
+    try:
+        resolved = Path(value).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise SystemExit(
+            f"ERROR: oracle submission record path {name!r} cannot be resolved: {error}"
+        ) from error
+    valid_type = resolved.is_dir() if directory else resolved.is_file()
+    if not valid_type:
+        expected_type = "directory" if directory else "file"
+        raise SystemExit(
+            f"ERROR: oracle submission record path {name!r} is not a {expected_type}: {resolved}"
+        )
+    return resolved
+
+
+expected_paths = {
+    "clip_parquet": Path(sys.argv[3]).resolve(strict=True),
+    "candidate_directory": Path(sys.argv[4]).resolve(strict=True),
+    "oracle_directory": Path(sys.argv[5]).resolve(strict=True),
+}
+for name, expected_path in expected_paths.items():
+    recorded_path = canonical_record_path(name, directory=name.endswith("directory"))
+    if recorded_path != expected_path:
+        raise SystemExit(
+            f"ERROR: oracle submission record {name} {recorded_path} "
+            f"does not match {expected_path}"
+        )
+
+oracle_repository = canonical_record_path("repository", directory=True)
+oracle_commit = source.get("repository_commit")
+if not isinstance(oracle_commit, str) or re.fullmatch(r"[0-9a-f]{40}", oracle_commit) is None:
+    raise SystemExit("ERROR: oracle submission record has no full lowercase source commit")
+
+
+def git_output(*arguments: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(oracle_repository), *arguments],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "git command failed"
+        raise SystemExit(f"ERROR: cannot validate oracle source repository: {detail}")
+    return result.stdout
+
+
+oracle_head = git_output("rev-parse", "--verify", "HEAD^{commit}").strip()
+if oracle_head != oracle_commit:
+    raise SystemExit(
+        f"ERROR: oracle source HEAD {oracle_head} does not match recorded commit {oracle_commit}"
+    )
+if git_output("status", "--porcelain", "--untracked-files=all"):
+    raise SystemExit(f"ERROR: oracle source worktree is dirty: {oracle_repository}")
+
+print(
+    json.dumps(
+        {
+            "oracle_repository_commit": oracle_commit,
+            "oracle_submission_record": str(record_path),
+            "oracle_submission_record_sha256": hashlib.sha256(record_bytes).hexdigest(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+)
+PY
+    )
+fi
 
 normalize_job_id() {
     local value=$1
@@ -234,7 +362,7 @@ export CANDIDATE_JOB_ID EXISTING_ORACLE_JOB_ID ORACLE_JOB PREP_JOB TRAIN_2026_JO
 export PERSISTENCE_JOB SELECT_JOB LEARNED_JOB LEARNED_RERANK_JOB
 export PERSISTENCE_RERANK_JOB FORECAST_COMPARE_JOB AGGREGATE_JOB RUN_DIR REPO_ROOT CLIP_PARQUET
 export CANDIDATE_DIR ORACLE_DIR EPOCHS EXPECTED_ROWS EXPECTED_CANDIDATES EXPECTED_SHARDS
-export ORACLE_CONCURRENCY ORACLE_CPUS ORACLE_MEMORY REPOSITORY_COMMIT
+export ORACLE_CONCURRENCY ORACLE_CPUS ORACLE_MEMORY REPOSITORY_COMMIT ORACLE_PROVENANCE_JSON
 "${PYTHON_BIN}" - <<'PY'
 import json
 import os
@@ -254,6 +382,21 @@ keys = (
     "FORECAST_COMPARE_JOB",
     "AGGREGATE_JOB",
 )
+oracle_provenance = (
+    json.loads(os.environ["ORACLE_PROVENANCE_JSON"])
+    if os.environ["ORACLE_PROVENANCE_JSON"]
+    else {}
+)
+source = {
+    "repository_commit": os.environ["REPOSITORY_COMMIT"],
+    "oracle_repository_commit": oracle_provenance.get(
+        "oracle_repository_commit", os.environ["REPOSITORY_COMMIT"]
+    ),
+}
+for name in ("oracle_submission_record", "oracle_submission_record_sha256"):
+    if name in oracle_provenance:
+        source[name] = oracle_provenance[name]
+
 payload = {
     "schema_version": 2,
     "jobs": {key.lower(): int(os.environ[key]) for key in keys},
@@ -278,7 +421,7 @@ payload = {
         "model_sharding": False,
         "reused_oracle_job": bool(os.environ["EXISTING_ORACLE_JOB_ID"]),
     },
-    "source": {"repository_commit": os.environ["REPOSITORY_COMMIT"]},
+    "source": source,
 }
 payload["jobs"]["candidate_job_id"] = (
     int(os.environ["CANDIDATE_JOB_ID"])
