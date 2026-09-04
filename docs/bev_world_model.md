@@ -58,7 +58,7 @@ python -m src.world_model.train \
   --train-manifest results/world_model/splits/train.jsonl \
   --val-manifest results/world_model/splits/val.jsonl \
   --output-dir results/world_model/run_001 \
-  --batch-size 4 --amp
+  --epochs 30 --batch-size 4 --amp
 
 python -m src.world_model.train \
   --protocol results/world_model/protocol.json \
@@ -75,7 +75,8 @@ loss also writes `best.pt`. A resumable checkpoint includes model, optimizer,
 GradScaler and RNG states, manifest hashes, source chunk sets, a SHA-256 digest
 for every oracle artifact, geometry, run configuration, and history. The source
 digests form a canonical dataset fingerprint. Resume fails if an artifact changes
-in place or if another invariant differs. `--epochs` may increase.
+in place or if another invariant differs. A resumed command must use the epoch
+count and all other training values in the frozen protocol.
 
 ## Evaluation and prediction artifacts
 
