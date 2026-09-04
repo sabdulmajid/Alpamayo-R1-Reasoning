@@ -13,6 +13,7 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 STAGE_SCRIPT = REPOSITORY_ROOT / "slurm" / "run_benchmark_stage.sh"
 SUBMIT_SCRIPT = REPOSITORY_ROOT / "slurm" / "submit_world_benchmark.sh"
+LINEAGE_TOOL = REPOSITORY_ROOT / "tools" / "oracle_lineage.py"
 
 
 def run_checked(*command: str | Path, **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -47,8 +48,25 @@ def initialize_submission_repository(path: Path) -> str:
         {
             "slurm/run_benchmark_stage.sh": STAGE_SCRIPT.read_text(encoding="utf-8"),
             "slurm/submit_world_benchmark.sh": SUBMIT_SCRIPT.read_text(encoding="utf-8"),
+            "tools/oracle_lineage.py": LINEAGE_TOOL.read_text(encoding="utf-8"),
         },
     )
+
+
+def initialize_oracle_repository(path: Path) -> tuple[str, str]:
+    producer_commit = initialize_repository(
+        path,
+        {
+            "slurm/build_lidar_world_oracle.sh": "#!/bin/sh\nexit 0\n",
+            "src/lidar_world_oracle.py": "# oracle fixture\n",
+            "src/revision_pinned_dataset.py": "# revision fixture\n",
+        },
+    )
+    (path / "submission-change.txt").write_text("resource metadata only\n", encoding="utf-8")
+    run_checked("git", "-C", path, "add", ".")
+    run_checked("git", "-C", path, "commit", "-q", "-m", "submission only")
+    current_commit = run_checked("git", "-C", path, "rev-parse", "HEAD").stdout.strip()
+    return producer_commit, current_commit
 
 
 def install_fake_sbatch(root: Path) -> tuple[Path, Path, Path]:
@@ -120,10 +138,89 @@ def write_original_oracle_record(
             "candidate_directory": str(candidate_dir),
             "oracle_directory": str(oracle_dir),
         },
-        "configuration": {"reused_oracle_job": False},
+        "configuration": {
+            "expected_candidates": 6,
+            "expected_oracle_shards": 8,
+            "expected_rows": 2000,
+            "oracle_concurrency": 8,
+            "oracle_cpus_per_task": 3,
+            "oracle_memory_per_task": "7G",
+            "reused_oracle_job": False,
+        },
         "source": {"repository_commit": repository_commit},
     }
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def write_prior_oracle_record(
+    path: Path,
+    *,
+    job_id: int,
+    repository: Path,
+    clip_parquet: Path,
+    candidate_dir: Path,
+    oracle_dir: Path,
+) -> None:
+    payload = {
+        "schema_version": 1,
+        "jobs": {"oracle_job": job_id},
+        "paths": {
+            "repository": str(repository),
+            "clip_parquet": str(clip_parquet),
+            "candidate_directory": str(candidate_dir),
+            "oracle_directory": str(oracle_dir),
+        },
+        "configuration": {"reused_oracle_job": True},
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def create_lineage_record(
+    root: Path,
+    *,
+    oracle_submission_record: Path,
+    oracle_repository: Path,
+    producer_commit: str,
+    clip_parquet: Path,
+    candidate_dir: Path,
+    oracle_dir: Path,
+) -> tuple[Path, Path, Path]:
+    clips = oracle_dir / "clips"
+    clips.mkdir(exist_ok=True)
+    first = clips / "first.oracle.npz"
+    second = clips / "second.oracle.npz"
+    first.write_bytes(b"first resumed artifact")
+    second.write_bytes(b"second resumed artifact")
+    artifact_list = root / "resumed-artifacts.txt"
+    artifact_list.write_text(
+        "clips/second.oracle.npz\nclips/first.oracle.npz\n", encoding="utf-8"
+    )
+    prior_record = root / "predecessor-submission.json"
+    write_prior_oracle_record(
+        prior_record,
+        job_id=666,
+        repository=oracle_repository,
+        clip_parquet=clip_parquet,
+        candidate_dir=candidate_dir,
+        oracle_dir=oracle_dir,
+    )
+    lineage_record = root / "oracle-lineage.json"
+    run_checked(
+        sys.executable,
+        LINEAGE_TOOL,
+        "create",
+        "--output",
+        lineage_record,
+        "--oracle-submission-record",
+        oracle_submission_record,
+        "--prior-submission-record",
+        prior_record,
+        "--resumed-producer",
+        f"666:{producer_commit}:667,668",
+        "--artifact-list",
+        artifact_list,
+    )
+    return lineage_record, prior_record, first
 
 
 class RuntimeSourceGuardTest(unittest.TestCase):
@@ -237,7 +334,9 @@ class RuntimeSourceGuardTest(unittest.TestCase):
             repository = root / "repository"
             current_commit = initialize_submission_repository(repository)
             oracle_repository = root / "oracle-repository"
-            oracle_commit = initialize_repository(oracle_repository)
+            producer_commit, oracle_commit = initialize_oracle_repository(
+                oracle_repository
+            )
             clip_parquet = root / "clips.parquet"
             clip_parquet.write_bytes(b"fixture")
             candidate_dir = root / "candidates"
@@ -255,6 +354,16 @@ class RuntimeSourceGuardTest(unittest.TestCase):
                 oracle_dir=oracle_dir,
             )
             prior_sha256 = hashlib.sha256(prior_record.read_bytes()).hexdigest()
+            lineage_record, predecessor_record, _ = create_lineage_record(
+                root,
+                oracle_submission_record=prior_record,
+                oracle_repository=oracle_repository,
+                producer_commit=producer_commit,
+                clip_parquet=clip_parquet,
+                candidate_dir=candidate_dir,
+                oracle_dir=oracle_dir,
+            )
+            lineage_sha256 = hashlib.sha256(lineage_record.read_bytes()).hexdigest()
             run_dir = root / "run"
             environment, log = submission_environment(
                 repository=repository,
@@ -266,6 +375,7 @@ class RuntimeSourceGuardTest(unittest.TestCase):
                 extra={
                     "BENCHMARK_ORACLE_JOB_ID": "777",
                     "BENCHMARK_ORACLE_SUBMISSION_RECORD": str(prior_record),
+                    "BENCHMARK_ORACLE_LINEAGE_RECORD": str(lineage_record),
                 },
             )
             run_checked(
@@ -277,6 +387,9 @@ class RuntimeSourceGuardTest(unittest.TestCase):
             self.assertEqual(submission["jobs"]["oracle_job"], 777)
             self.assertIsNone(submission["jobs"]["candidate_job_id"])
             self.assertTrue(submission["configuration"]["reused_oracle_job"])
+            self.assertEqual(submission["configuration"]["oracle_concurrency"], 8)
+            self.assertEqual(submission["configuration"]["oracle_cpus_per_task"], 3)
+            self.assertEqual(submission["configuration"]["oracle_memory_per_task"], "7G")
             self.assertEqual(submission["source"]["repository_commit"], current_commit)
             self.assertEqual(
                 submission["source"]["oracle_repository_commit"], oracle_commit
@@ -288,6 +401,22 @@ class RuntimeSourceGuardTest(unittest.TestCase):
             self.assertEqual(
                 submission["source"]["oracle_submission_record_sha256"], prior_sha256
             )
+            self.assertEqual(
+                submission["source"]["oracle_lineage_record"],
+                str(lineage_record.resolve()),
+            )
+            self.assertEqual(
+                submission["source"]["oracle_lineage_record_sha256"], lineage_sha256
+            )
+            self.assertEqual(
+                submission["source"]["oracle_artifact_producer_commits"],
+                sorted([producer_commit, oracle_commit]),
+            )
+            self.assertEqual(submission["source"]["oracle_resumed_artifact_count"], 2)
+            lineage = json.loads(lineage_record.read_text(encoding="utf-8"))
+            self.assertEqual(
+                lineage["prior_submission"]["path"], str(predecessor_record.resolve())
+            )
             calls = log.read_text(encoding="utf-8").split("CALL\n")[1:]
             self.assertEqual(len(calls), 10)
             expected_export = f"BENCHMARK_REPOSITORY_COMMIT={current_commit}"
@@ -297,6 +426,146 @@ class RuntimeSourceGuardTest(unittest.TestCase):
                     for call in calls
                 )
             )
+
+    def test_reused_oracle_rejects_configuration_drift_before_sbatch(self) -> None:
+        cases = (
+            ("BENCHMARK_EXPECTED_SHARDS", "7", "expected_oracle_shards"),
+            ("BENCHMARK_EXPECTED_ROWS", "1999", "expected_rows"),
+            ("BENCHMARK_EXPECTED_CANDIDATES", "5", "expected_candidates"),
+        )
+        for variable, value, expected_error in cases:
+            with self.subTest(variable=variable), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repository = root / "repository"
+                initialize_submission_repository(repository)
+                oracle_repository = root / "oracle-repository"
+                producer_commit, oracle_commit = initialize_oracle_repository(
+                    oracle_repository
+                )
+                clip_parquet = root / "clips.parquet"
+                clip_parquet.write_bytes(b"fixture")
+                candidate_dir = root / "candidates"
+                oracle_dir = root / "oracle"
+                candidate_dir.mkdir()
+                oracle_dir.mkdir()
+                original_record = root / "original-submission.json"
+                write_original_oracle_record(
+                    original_record,
+                    job_id=777,
+                    repository=oracle_repository,
+                    repository_commit=oracle_commit,
+                    clip_parquet=clip_parquet,
+                    candidate_dir=candidate_dir,
+                    oracle_dir=oracle_dir,
+                )
+                lineage_record, _, _ = create_lineage_record(
+                    root,
+                    oracle_submission_record=original_record,
+                    oracle_repository=oracle_repository,
+                    producer_commit=producer_commit,
+                    clip_parquet=clip_parquet,
+                    candidate_dir=candidate_dir,
+                    oracle_dir=oracle_dir,
+                )
+                environment, log = submission_environment(
+                    repository=repository,
+                    root=root,
+                    clip_parquet=clip_parquet,
+                    candidate_dir=candidate_dir,
+                    oracle_dir=oracle_dir,
+                    run_dir=root / "run",
+                    extra={
+                        "BENCHMARK_ORACLE_JOB_ID": "777",
+                        "BENCHMARK_ORACLE_SUBMISSION_RECORD": str(original_record),
+                        "BENCHMARK_ORACLE_LINEAGE_RECORD": str(lineage_record),
+                        variable: value,
+                    },
+                )
+                result = subprocess.run(
+                    [str(repository / "slurm" / "submit_world_benchmark.sh")],
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+                self.assertFalse(log.exists())
+
+    def test_reused_oracle_rejects_invalid_lineage_before_sbatch(self) -> None:
+        cases = (
+            ("artifact", "resumed artifact SHA-256 does not match"),
+            ("prior_record", "prior submission record SHA-256 does not match"),
+            ("implementation_blob", "implementation blob differs"),
+        )
+        for case, expected_error in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repository = root / "repository"
+                initialize_submission_repository(repository)
+                oracle_repository = root / "oracle-repository"
+                producer_commit, oracle_commit = initialize_oracle_repository(
+                    oracle_repository
+                )
+                clip_parquet = root / "clips.parquet"
+                clip_parquet.write_bytes(b"fixture")
+                candidate_dir = root / "candidates"
+                oracle_dir = root / "oracle"
+                candidate_dir.mkdir()
+                oracle_dir.mkdir()
+                original_record = root / "original-submission.json"
+                write_original_oracle_record(
+                    original_record,
+                    job_id=777,
+                    repository=oracle_repository,
+                    repository_commit=oracle_commit,
+                    clip_parquet=clip_parquet,
+                    candidate_dir=candidate_dir,
+                    oracle_dir=oracle_dir,
+                )
+                lineage_record, prior_record, first_artifact = create_lineage_record(
+                    root,
+                    oracle_submission_record=original_record,
+                    oracle_repository=oracle_repository,
+                    producer_commit=producer_commit,
+                    clip_parquet=clip_parquet,
+                    candidate_dir=candidate_dir,
+                    oracle_dir=oracle_dir,
+                )
+                if case == "artifact":
+                    first_artifact.write_bytes(b"changed")
+                elif case == "prior_record":
+                    prior_record.write_text(
+                        prior_record.read_text(encoding="utf-8") + "\n", encoding="utf-8"
+                    )
+                else:
+                    lineage = json.loads(lineage_record.read_text(encoding="utf-8"))
+                    lineage["implementation_equivalence"]["paths"][0]["git_blob"] = "0" * 40
+                    lineage_record.write_text(
+                        json.dumps(lineage, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                environment, log = submission_environment(
+                    repository=repository,
+                    root=root,
+                    clip_parquet=clip_parquet,
+                    candidate_dir=candidate_dir,
+                    oracle_dir=oracle_dir,
+                    run_dir=root / "run",
+                    extra={
+                        "BENCHMARK_ORACLE_JOB_ID": "777",
+                        "BENCHMARK_ORACLE_SUBMISSION_RECORD": str(original_record),
+                        "BENCHMARK_ORACLE_LINEAGE_RECORD": str(lineage_record),
+                    },
+                )
+                result = subprocess.run(
+                    [str(repository / "slurm" / "submit_world_benchmark.sh")],
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+                self.assertFalse(log.exists())
 
     def test_reused_oracle_rejects_unbound_submission_records(self) -> None:
         cases = (
@@ -368,6 +637,9 @@ class RuntimeSourceGuardTest(unittest.TestCase):
                     extra={
                         "BENCHMARK_ORACLE_JOB_ID": "777",
                         "BENCHMARK_ORACLE_SUBMISSION_RECORD": str(prior_record),
+                        "BENCHMARK_ORACLE_LINEAGE_RECORD": str(
+                            root / "unused-lineage.json"
+                        ),
                     },
                 )
                 result = subprocess.run(
@@ -406,6 +678,35 @@ class RuntimeSourceGuardTest(unittest.TestCase):
             self.assertIn("BENCHMARK_ORACLE_SUBMISSION_RECORD", result.stderr)
             self.assertFalse(log.exists())
 
+    def test_reused_oracle_requires_lineage_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            initialize_submission_repository(repository)
+            clip_parquet = root / "clips.parquet"
+            clip_parquet.write_bytes(b"fixture")
+            environment, log = submission_environment(
+                repository=repository,
+                root=root,
+                clip_parquet=clip_parquet,
+                candidate_dir=root / "candidates",
+                oracle_dir=root / "oracle",
+                run_dir=root / "run",
+                extra={
+                    "BENCHMARK_ORACLE_JOB_ID": "777",
+                    "BENCHMARK_ORACLE_SUBMISSION_RECORD": str(root / "submission.json"),
+                },
+            )
+            result = subprocess.run(
+                [str(repository / "slurm" / "submit_world_benchmark.sh")],
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("BENCHMARK_ORACLE_LINEAGE_RECORD", result.stderr)
+            self.assertFalse(log.exists())
+
     def test_reused_oracle_rejects_missing_submission_record_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -423,6 +724,7 @@ class RuntimeSourceGuardTest(unittest.TestCase):
                 extra={
                     "BENCHMARK_ORACLE_JOB_ID": "777",
                     "BENCHMARK_ORACLE_SUBMISSION_RECORD": str(root / "missing.json"),
+                    "BENCHMARK_ORACLE_LINEAGE_RECORD": str(root / "unused-lineage.json"),
                 },
             )
             result = subprocess.run(

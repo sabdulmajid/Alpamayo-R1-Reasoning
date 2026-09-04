@@ -9,6 +9,7 @@ PYTHON_BIN=${BENCHMARK_PYTHON:-python3}
 CANDIDATE_JOB_ID=${BENCHMARK_CANDIDATE_JOB_ID:-}
 EXISTING_ORACLE_JOB_ID=${BENCHMARK_ORACLE_JOB_ID:-}
 ORACLE_SUBMISSION_RECORD=${BENCHMARK_ORACLE_SUBMISSION_RECORD:-}
+ORACLE_LINEAGE_RECORD=${BENCHMARK_ORACLE_LINEAGE_RECORD:-}
 CLIP_PARQUET=${BENCHMARK_CLIP_PARQUET:?Set BENCHMARK_CLIP_PARQUET}
 CANDIDATE_DIR=${BENCHMARK_CANDIDATE_DIR:?Set BENCHMARK_CANDIDATE_DIR}
 ORACLE_DIR=${BENCHMARK_ORACLE_DIR:?Set BENCHMARK_ORACLE_DIR}
@@ -30,6 +31,10 @@ if [[ -n "${EXISTING_ORACLE_JOB_ID}" ]]; then
         echo "ERROR: set BENCHMARK_ORACLE_SUBMISSION_RECORD when reusing an oracle job" >&2
         exit 2
     fi
+    if [[ -z "${ORACLE_LINEAGE_RECORD}" ]]; then
+        echo "ERROR: set BENCHMARK_ORACLE_LINEAGE_RECORD when reusing an oracle job" >&2
+        exit 2
+    fi
 elif [[ ! "${CANDIDATE_JOB_ID}" =~ ^[0-9]+$ ]]; then
     echo "ERROR: set a numeric BENCHMARK_CANDIDATE_JOB_ID or BENCHMARK_ORACLE_JOB_ID" >&2
     exit 2
@@ -42,6 +47,12 @@ if [[ ! "${ORACLE_CPUS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: BENCHMARK_ORACLE_CPUS must be a positive integer" >&2
     exit 2
 fi
+for value_name in EXPECTED_SHARDS EXPECTED_ROWS EXPECTED_CANDIDATES; do
+    if [[ ! "${!value_name}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: BENCHMARK_${value_name} must be a positive integer" >&2
+        exit 2
+    fi
+done
 if ! command -v sbatch >/dev/null 2>&1; then
     echo "ERROR: sbatch is unavailable" >&2
     exit 2
@@ -79,7 +90,10 @@ if [[ -n "${EXISTING_ORACLE_JOB_ID}" ]]; then
         "${EXISTING_ORACLE_JOB_ID}" \
         "${CLIP_PARQUET}" \
         "${CANDIDATE_DIR}" \
-        "${ORACLE_DIR}" <<'PY'
+        "${ORACLE_DIR}" \
+        "${EXPECTED_SHARDS}" \
+        "${EXPECTED_ROWS}" \
+        "${EXPECTED_CANDIDATES}" <<'PY'
 import hashlib
 import json
 import re
@@ -113,6 +127,30 @@ if not all(isinstance(value, dict) for value in (jobs, paths, source, configurat
     raise SystemExit("ERROR: oracle submission record is missing required objects")
 if configuration.get("reused_oracle_job") is not False:
     raise SystemExit("ERROR: oracle submission record must describe the original oracle job")
+
+expected_configuration = {
+    "expected_oracle_shards": int(sys.argv[6]),
+    "expected_rows": int(sys.argv[7]),
+    "expected_candidates": int(sys.argv[8]),
+}
+for name, expected_value in expected_configuration.items():
+    recorded_value = configuration.get(name)
+    if isinstance(recorded_value, bool) or recorded_value != expected_value:
+        raise SystemExit(
+            f"ERROR: oracle submission record {name} {recorded_value!r} "
+            f"does not match {expected_value}"
+        )
+
+oracle_configuration = {}
+for name in ("oracle_concurrency", "oracle_cpus_per_task"):
+    value = configuration.get(name)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise SystemExit(f"ERROR: oracle submission record has invalid {name}")
+    oracle_configuration[name] = value
+oracle_memory = configuration.get("oracle_memory_per_task")
+if not isinstance(oracle_memory, str) or re.fullmatch(r"[1-9][0-9]*[KMGTP]?", oracle_memory) is None:
+    raise SystemExit("ERROR: oracle submission record has invalid oracle_memory_per_task")
+oracle_configuration["oracle_memory_per_task"] = oracle_memory
 
 expected_job = int(sys.argv[2])
 recorded_job = jobs.get("oracle_job")
@@ -184,6 +222,7 @@ print(
     json.dumps(
         {
             "oracle_repository_commit": oracle_commit,
+            "oracle_configuration": oracle_configuration,
             "oracle_submission_record": str(record_path),
             "oracle_submission_record_sha256": hashlib.sha256(record_bytes).hexdigest(),
         },
@@ -193,6 +232,15 @@ print(
 )
 PY
     )
+    ORACLE_LINEAGE_JSON=$("${PYTHON_BIN}" "${REPO_ROOT}/tools/oracle_lineage.py" validate \
+        --record "${ORACLE_LINEAGE_RECORD}" \
+        --oracle-submission-record "${ORACLE_SUBMISSION_RECORD}" \
+        --oracle-job "${EXISTING_ORACLE_JOB_ID}" \
+        --clip-parquet "${CLIP_PARQUET}" \
+        --candidate-directory "${CANDIDATE_DIR}" \
+        --oracle-directory "${ORACLE_DIR}")
+else
+    ORACLE_LINEAGE_JSON=
 fi
 
 normalize_job_id() {
@@ -363,6 +411,7 @@ export PERSISTENCE_JOB SELECT_JOB LEARNED_JOB LEARNED_RERANK_JOB
 export PERSISTENCE_RERANK_JOB FORECAST_COMPARE_JOB AGGREGATE_JOB RUN_DIR REPO_ROOT CLIP_PARQUET
 export CANDIDATE_DIR ORACLE_DIR EPOCHS EXPECTED_ROWS EXPECTED_CANDIDATES EXPECTED_SHARDS
 export ORACLE_CONCURRENCY ORACLE_CPUS ORACLE_MEMORY REPOSITORY_COMMIT ORACLE_PROVENANCE_JSON
+export ORACLE_LINEAGE_JSON
 "${PYTHON_BIN}" - <<'PY'
 import json
 import os
@@ -393,9 +442,32 @@ source = {
         "oracle_repository_commit", os.environ["REPOSITORY_COMMIT"]
     ),
 }
+lineage = (
+    json.loads(os.environ["ORACLE_LINEAGE_JSON"])
+    if os.environ["ORACLE_LINEAGE_JSON"]
+    else {}
+)
+source.update(lineage)
 for name in ("oracle_submission_record", "oracle_submission_record_sha256"):
     if name in oracle_provenance:
         source[name] = oracle_provenance[name]
+
+configuration = {
+    "epochs": int(os.environ["EPOCHS"]),
+    "expected_rows": int(os.environ["EXPECTED_ROWS"]),
+    "expected_candidates": int(os.environ["EXPECTED_CANDIDATES"]),
+    "expected_oracle_shards": int(os.environ["EXPECTED_SHARDS"]),
+    "oracle_concurrency": int(os.environ["ORACLE_CONCURRENCY"]),
+    "oracle_cpus_per_task": int(os.environ["ORACLE_CPUS"]),
+    "oracle_memory_per_task": os.environ["ORACLE_MEMORY"],
+    "training_seeds": [2026, 2027],
+    "maximum_concurrent_gpu_jobs": 2,
+    "gpus_per_training_job": 1,
+    "model_sharding": False,
+    "reused_oracle_job": bool(os.environ["EXISTING_ORACLE_JOB_ID"]),
+}
+if oracle_provenance:
+    configuration.update(oracle_provenance["oracle_configuration"])
 
 payload = {
     "schema_version": 2,
@@ -407,20 +479,7 @@ payload = {
         "oracle_directory": os.environ["ORACLE_DIR"],
         "run_directory": os.environ["RUN_DIR"],
     },
-    "configuration": {
-        "epochs": int(os.environ["EPOCHS"]),
-        "expected_rows": int(os.environ["EXPECTED_ROWS"]),
-        "expected_candidates": int(os.environ["EXPECTED_CANDIDATES"]),
-        "expected_oracle_shards": int(os.environ["EXPECTED_SHARDS"]),
-        "oracle_concurrency": int(os.environ["ORACLE_CONCURRENCY"]),
-        "oracle_cpus_per_task": int(os.environ["ORACLE_CPUS"]),
-        "oracle_memory_per_task": os.environ["ORACLE_MEMORY"],
-        "training_seeds": [2026, 2027],
-        "maximum_concurrent_gpu_jobs": 2,
-        "gpus_per_training_job": 1,
-        "model_sharding": False,
-        "reused_oracle_job": bool(os.environ["EXISTING_ORACLE_JOB_ID"]),
-    },
+    "configuration": configuration,
     "source": source,
 }
 payload["jobs"]["candidate_job_id"] = (
