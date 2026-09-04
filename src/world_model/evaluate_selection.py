@@ -24,6 +24,14 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from .data import load_manifest, load_occupancy_artifact, write_jsonl
+from .protocol import (
+    FrozenProtocol,
+    load_frozen_protocol,
+    require_exact_mapping,
+    validate_manifest_binding,
+    validate_source_manifest_binding,
+    validate_uncertainty_configuration,
+)
 from .runtime import canonical_fingerprint, sha256_file, write_json
 
 
@@ -716,15 +724,150 @@ def _require_uniform(values: Sequence[Any], name: str) -> Any:
     return values[0]
 
 
+def _selection_gate_configuration(protocol: FrozenProtocol) -> Mapping[str, Any]:
+    gates = protocol.payload["acceptance_gates"].get("selection")
+    if not isinstance(gates, dict):
+        raise ValueError("Frozen protocol acceptance_gates.selection must be an object")
+    expected_names = {
+        "candidate_0_collision_exposure_relative_reduction_minimum",
+        "learned_collision_exposure_no_worse_than_persistence",
+        "ade_degradation_m_paired_ci_95_upper_maximum",
+        "out_of_bounds_fraction_no_higher_than_candidate_0",
+        "observed_fraction_no_lower_than_candidate_0",
+    }
+    if set(gates) != expected_names:
+        raise ValueError("Frozen protocol selection acceptance gates are not supported exactly")
+    for name in (
+        "candidate_0_collision_exposure_relative_reduction_minimum",
+        "ade_degradation_m_paired_ci_95_upper_maximum",
+    ):
+        value = gates[name]
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or float(value) < 0
+        ):
+            raise ValueError(f"Frozen protocol selection gate {name} must be non-negative")
+    for name in expected_names - {
+        "candidate_0_collision_exposure_relative_reduction_minimum",
+        "ade_degradation_m_paired_ci_95_upper_maximum",
+    }:
+        if gates[name] is not True:
+            raise ValueError(f"Frozen protocol selection gate {name} must be true")
+    return gates
+
+
+def _selection_gate_decisions(
+    protocol: FrozenProtocol,
+    policy_aggregates: Mapping[str, Mapping[str, float]],
+    comparisons: Mapping[str, Mapping[str, Mapping[str, float | int]]],
+) -> dict[str, Any]:
+    gates = _selection_gate_configuration(protocol)
+    candidate_0 = policy_aggregates["candidate_0"]
+    learned = policy_aggregates["learned_selected"]
+    persistence = policy_aggregates["persistence_selected"]
+    baseline_exposure = candidate_0["collision_exposure"]
+    learned_exposure = learned["collision_exposure"]
+    minimum_reduction = float(
+        gates["candidate_0_collision_exposure_relative_reduction_minimum"]
+    )
+    if baseline_exposure == 0.0:
+        relative_reduction: float | None = None
+        reduction_passed = False
+        reduction_reason = (
+            "Candidate zero has zero mean collision exposure. The benchmark cannot "
+            "demonstrate a relative reduction from a zero baseline."
+        )
+    else:
+        relative_reduction = (baseline_exposure - learned_exposure) / baseline_exposure
+        reduction_passed = relative_reduction >= minimum_reduction
+        reduction_reason = (
+            "The relative reduction meets the predeclared minimum."
+            if reduction_passed
+            else "The relative reduction does not meet the predeclared minimum."
+        )
+
+    exposure_no_worse = learned_exposure <= persistence["collision_exposure"]
+    ade_interval = comparisons["learned_selected_minus_candidate_0"]["ade_m"]
+    ade_upper = float(ade_interval["ci_95_upper"])
+    ade_maximum = float(gates["ade_degradation_m_paired_ci_95_upper_maximum"])
+    ade_passed = ade_upper <= ade_maximum
+    oob_no_higher = (
+        learned["out_of_bounds_fraction"] <= candidate_0["out_of_bounds_fraction"]
+    )
+    observed_no_lower = learned["observed_fraction"] >= candidate_0["observed_fraction"]
+    decisions = {
+        "candidate_0_collision_exposure_relative_reduction_minimum": {
+            "threshold": minimum_reduction,
+            "passed": reduction_passed,
+            "reason": reduction_reason,
+            "candidate_0": baseline_exposure,
+            "learned_selected": learned_exposure,
+            "relative_reduction": relative_reduction,
+        },
+        "learned_collision_exposure_no_worse_than_persistence": {
+            "required": True,
+            "passed": exposure_no_worse,
+            "reason": (
+                "Learned selection has no higher mean collision exposure."
+                if exposure_no_worse
+                else "Learned selection has higher mean collision exposure."
+            ),
+            "learned_selected": learned_exposure,
+            "persistence_selected": persistence["collision_exposure"],
+        },
+        "ade_degradation_m_paired_ci_95_upper_maximum": {
+            "threshold_m": ade_maximum,
+            "passed": ade_passed,
+            "reason": (
+                "The paired 95% interval upper bound meets the predeclared maximum."
+                if ade_passed
+                else "The paired 95% interval upper bound exceeds the predeclared maximum."
+            ),
+            "paired_difference_m": ade_interval["estimate"],
+            "ci_95_lower_m": ade_interval["ci_95_lower"],
+            "ci_95_upper_m": ade_upper,
+        },
+        "out_of_bounds_fraction_no_higher_than_candidate_0": {
+            "required": True,
+            "passed": oob_no_higher,
+            "reason": (
+                "Learned selection has no higher mean out-of-bounds fraction."
+                if oob_no_higher
+                else "Learned selection has a higher mean out-of-bounds fraction."
+            ),
+            "candidate_0": candidate_0["out_of_bounds_fraction"],
+            "learned_selected": learned["out_of_bounds_fraction"],
+        },
+        "observed_fraction_no_lower_than_candidate_0": {
+            "required": True,
+            "passed": observed_no_lower,
+            "reason": (
+                "Learned selection has no lower mean observed fraction."
+                if observed_no_lower
+                else "Learned selection has a lower mean observed fraction."
+            ),
+            "candidate_0": candidate_0["observed_fraction"],
+            "learned_selected": learned["observed_fraction"],
+        },
+    }
+    return {
+        "all_passed": all(decision["passed"] for decision in decisions.values()),
+        "decisions": decisions,
+    }
+
+
 def evaluate_selection(
     *,
+    protocol: str | Path,
     test_manifest: str | Path,
     train_manifest: str | Path,
     oracle_manifest: str | Path,
     learned_selections: str | Path,
     persistence_selections: str | Path,
     candidate_dir: str | Path,
-    validation_manifest: str | Path | None = None,
+    validation_manifest: str | Path,
     bootstrap_replicates: int = 10_000,
     bootstrap_seed: int = 2026,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -735,17 +878,30 @@ def evaluate_selection(
     oracle_manifest_path = Path(oracle_manifest).expanduser().resolve()
     learned_path = Path(learned_selections).expanduser().resolve()
     persistence_path = Path(persistence_selections).expanduser().resolve()
-    validation_path = (
-        Path(validation_manifest).expanduser().resolve()
-        if validation_manifest is not None
-        else None
+    frozen_protocol = load_frozen_protocol(protocol)
+    validate_uncertainty_configuration(
+        frozen_protocol, replicates=bootstrap_replicates, seed=bootstrap_seed
     )
+    _selection_gate_configuration(frozen_protocol)
+    validation_path = Path(validation_manifest).expanduser().resolve()
     test_rows = load_manifest(test_path)
     train_rows = load_manifest(train_path)
     _reject_split_leakage(test_rows, train_rows, "train")
-    if validation_path is not None:
-        validation_rows = load_manifest(validation_path)
-        _reject_split_leakage(test_rows, validation_rows, "validation")
+    validation_rows = load_manifest(validation_path)
+    _reject_split_leakage(test_rows, validation_rows, "validation")
+    for name, path, rows in (
+        ("test", test_path, test_rows),
+        ("train", train_path, train_rows),
+        ("val", validation_path, validation_rows),
+    ):
+        validate_manifest_binding(
+            frozen_protocol,
+            name,
+            path,
+            clips=len(rows),
+            chunks=len({str(row["chunk_id"]) for row in rows}),
+        )
+    validate_source_manifest_binding(frozen_protocol, oracle_manifest_path)
 
     test_index = _index_rows(test_rows, "test manifest")
     oracle_index = _index_rows(load_manifest(oracle_manifest_path), "oracle manifest")
@@ -1019,6 +1175,16 @@ def evaluate_selection(
         rerank_weights["learned"] + rerank_weights["persistence"],
         "reranker weights",
     )
+    require_exact_mapping(
+        frozen_protocol.payload["trajectory_selection"],
+        {
+            "primary_outcome": "collision_exposure",
+            "baseline": "candidate_0",
+            "learned_comparator": "persistence_selected",
+            "reranker_weights": uniform_weights,
+        },
+        "trajectory_selection",
+    )
     uniform_candidate_count = _require_uniform(candidate_counts, "candidate counts")
 
     cluster_ids = [str(row["chunk_id"]) for row in per_clip]
@@ -1197,6 +1363,7 @@ def evaluate_selection(
     }
     summary: dict[str, Any] = {
         "schema_version": OUTPUT_SCHEMA_VERSION,
+        "protocol": frozen_protocol.provenance(),
         "evaluation": {
             "clips": len(per_clip),
             "source_chunks": len(set(cluster_ids)),
@@ -1205,6 +1372,14 @@ def evaluate_selection(
             "confidence_interval": "paired source-chunk cluster bootstrap percentile",
             "bootstrap_replicates": bootstrap_replicates,
             "bootstrap_seed": bootstrap_seed,
+            "uncertainty_scope": {
+                "held_out_source_chunk_sampling": True,
+                "training_seed_variability_included": False,
+                "statement": (
+                    "Intervals cover held-out source-chunk sampling only. They do not "
+                    "cover optimization-seed variability after checkpoint selection."
+                ),
+            },
         },
         "run": {
             "learned": {
@@ -1230,6 +1405,9 @@ def evaluate_selection(
         "metric_metadata": METRIC_METADATA,
         "policy_macro_means": policy_aggregates,
         "paired_differences": comparisons,
+        "acceptance_gates": _selection_gate_decisions(
+            frozen_protocol, policy_aggregates, comparisons
+        ),
         "selection_rates": rates,
         "candidate_diversity": diversity_summary,
         "provenance": {
@@ -1237,10 +1415,8 @@ def evaluate_selection(
             "test_manifest_sha256": sha256_file(test_path),
             "train_manifest": str(train_path),
             "train_manifest_sha256": sha256_file(train_path),
-            "validation_manifest": str(validation_path) if validation_path else None,
-            "validation_manifest_sha256": (
-                sha256_file(validation_path) if validation_path else None
-            ),
+            "validation_manifest": str(validation_path),
+            "validation_manifest_sha256": sha256_file(validation_path),
             "oracle_manifest": str(oracle_manifest_path),
             "oracle_manifest_sha256": sha256_file(oracle_manifest_path),
             "learned_selections": str(learned_path),
@@ -1265,9 +1441,10 @@ def evaluate_selection(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--protocol", required=True)
     parser.add_argument("--test-manifest", required=True)
     parser.add_argument("--train-manifest", required=True)
-    parser.add_argument("--validation-manifest")
+    parser.add_argument("--validation-manifest", required=True)
     parser.add_argument("--oracle-manifest", required=True)
     parser.add_argument("--learned-selections", required=True)
     parser.add_argument("--persistence-selections", required=True)
@@ -1282,6 +1459,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     summary, per_clip = evaluate_selection(
+        protocol=args.protocol,
         test_manifest=args.test_manifest,
         train_manifest=args.train_manifest,
         validation_manifest=args.validation_manifest,

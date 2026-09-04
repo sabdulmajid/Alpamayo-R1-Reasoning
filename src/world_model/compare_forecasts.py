@@ -17,6 +17,13 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from .data import load_manifest, load_occupancy_artifact
+from .protocol import (
+    FrozenProtocol,
+    load_frozen_protocol,
+    require_exact_mapping,
+    validate_manifest_binding,
+    validate_uncertainty_configuration,
+)
 from .runtime import (
     canonical_fingerprint,
     prediction_filename,
@@ -34,6 +41,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--protocol", required=True, help="Frozen benchmark protocol JSON")
     parser.add_argument("--manifest", required=True, help="Frozen test JSONL manifest")
     parser.add_argument("--learned-prediction-dir", required=True)
     parser.add_argument("--persistence-prediction-dir", required=True)
@@ -43,6 +51,97 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bootstrap-replicates", type=int, default=10_000)
     parser.add_argument("--bootstrap-seed", type=int, default=2026)
     return parser
+
+
+def _validate_forecast_protocol(
+    protocol: FrozenProtocol,
+    *,
+    threshold: float,
+    ap_bins: int,
+    bootstrap_replicates: int,
+    bootstrap_seed: int,
+) -> None:
+    configuration = protocol.payload["forecast_evaluation"]
+    expected_configuration = {
+        "metrics": ["average_precision", "brier", "iou"],
+        "short_horizons_s": list(SHORT_HORIZONS_S),
+        "probability_threshold": threshold,
+        "average_precision_bins": ap_bins,
+        "post_test_threshold_tuning": False,
+        "comparison": "learned_minus_persistence",
+    }
+    require_exact_mapping(
+        configuration, expected_configuration, "forecast_evaluation"
+    )
+    expected_gates = {
+        "average_precision": "learned_higher_than_persistence",
+        "brier": "learned_lower_than_persistence",
+        "iou": "learned_higher_than_persistence",
+    }
+    require_exact_mapping(
+        protocol.payload["acceptance_gates"].get("forecast"),
+        expected_gates,
+        "acceptance_gates.forecast",
+    )
+    validate_uncertainty_configuration(
+        protocol, replicates=bootstrap_replicates, seed=bootstrap_seed
+    )
+
+
+def _forecast_gate_decisions(
+    protocol: FrozenProtocol,
+    methods: Mapping[str, Any],
+    paired: Mapping[str, Any],
+) -> dict[str, Any]:
+    rules = protocol.payload["acceptance_gates"]["forecast"]
+    learned = methods["learned"]["short_horizon"]
+    persistence = methods["persistence"]["short_horizon"]
+    paired_short = paired["short_horizon"]
+    decisions: dict[str, Any] = {}
+    for metric, rule in rules.items():
+        learned_value = learned[metric]
+        persistence_value = persistence[metric]
+        difference = paired_short[metric]["estimate"]
+        values_defined = all(
+            value is not None and np.isfinite(float(value))
+            for value in (learned_value, persistence_value, difference)
+        )
+        if not values_defined:
+            passed = False
+            reason = "The short-horizon point estimates are not all defined."
+        elif rule == "learned_higher_than_persistence":
+            passed = float(difference) > 0.0
+            reason = (
+                "The learned short-horizon point estimate is higher."
+                if passed
+                else "The learned short-horizon point estimate is not higher."
+            )
+        elif rule == "learned_lower_than_persistence":
+            passed = float(difference) < 0.0
+            reason = (
+                "The learned short-horizon point estimate is lower."
+                if passed
+                else "The learned short-horizon point estimate is not lower."
+            )
+        else:  # Guarded by _validate_forecast_protocol.
+            raise AssertionError(f"Unsupported forecast gate rule: {rule}")
+        decisions[metric] = {
+            "rule": rule,
+            "passed": passed,
+            "reason": reason,
+            "learned": learned_value,
+            "persistence": persistence_value,
+            "learned_minus_persistence": difference,
+            "paired_percentile_95_ci": paired_short[metric]["percentile_95_ci"],
+        }
+    return {
+        "all_passed": all(decision["passed"] for decision in decisions.values()),
+        "basis": (
+            "Predeclared short-horizon clip-macro point estimates. Confidence "
+            "intervals are reported but do not change these directional gates."
+        ),
+        "decisions": decisions,
+    }
 
 
 def _scalar(archive: Mapping[str, np.ndarray], name: str) -> Any:
@@ -454,6 +553,7 @@ def _paired_summary(
 
 def compare_forecasts(
     *,
+    protocol: str | Path,
     manifest: str | Path,
     learned_prediction_dir: str | Path,
     persistence_prediction_dir: str | Path,
@@ -470,8 +570,25 @@ def compare_forecasts(
         raise ValueError("ap_bins must be at least 2")
     if bootstrap_replicates < 1:
         raise ValueError("bootstrap_replicates must be positive")
+    frozen_protocol = load_frozen_protocol(protocol)
+    _validate_forecast_protocol(
+        frozen_protocol,
+        threshold=threshold,
+        ap_bins=ap_bins,
+        bootstrap_replicates=bootstrap_replicates,
+        bootstrap_seed=bootstrap_seed,
+    )
     manifest_path = Path(manifest).expanduser().resolve()
     records, manifest_provenance = _manifest_inputs(manifest_path)
+    validate_manifest_binding(
+        frozen_protocol,
+        "test",
+        manifest_path,
+        actual_sha256=manifest_provenance["manifest_sha256"],
+        clips=manifest_provenance["clips"],
+        chunks=manifest_provenance["chunks"],
+        dataset_fingerprint=manifest_provenance["dataset_fingerprint"],
+    )
     if manifest_provenance["chunks"] < 2:
         raise ValueError("Chunk-cluster uncertainty requires at least two source chunks")
     identity_to_record = {
@@ -566,9 +683,14 @@ def compare_forecasts(
         bootstrap_replicates=bootstrap_replicates,
         bootstrap_seed=bootstrap_seed,
     )
+    method_summaries = {
+        "learned": _method_summary(values["learned"], horizons_s),
+        "persistence": _method_summary(values["persistence"], horizons_s),
+    }
     return {
         "schema_version": COMPARISON_SCHEMA_VERSION,
         "comparison": "learned_minus_persistence",
+        "protocol": frozen_protocol.provenance(),
         "configuration": {
             "threshold": threshold,
             "average_precision": {
@@ -585,6 +707,14 @@ def compare_forecasts(
                 "resampling_unit": "source_chunk",
                 "cell_level_resampling": False,
             },
+            "uncertainty_scope": {
+                "held_out_source_chunk_sampling": True,
+                "training_seed_variability_included": False,
+                "statement": (
+                    "Intervals cover held-out source-chunk sampling only. They do not "
+                    "cover optimization-seed variability after checkpoint selection."
+                ),
+            },
         },
         "estimand": (
             "Each metric is computed for each visible clip-horizon. Selected horizons are "
@@ -599,17 +729,18 @@ def compare_forecasts(
             "manifest": manifest_provenance,
             "predictions": run_provenance,
         },
-        "metrics": {
-            "learned": _method_summary(values["learned"], horizons_s),
-            "persistence": _method_summary(values["persistence"], horizons_s),
-        },
+        "metrics": method_summaries,
         "paired_differences": paired,
+        "acceptance_gates": _forecast_gate_decisions(
+            frozen_protocol, method_summaries, paired
+        ),
     }
 
 
 def main() -> None:
     args = build_parser().parse_args()
     result = compare_forecasts(
+        protocol=args.protocol,
         manifest=args.manifest,
         learned_prediction_dir=args.learned_prediction_dir,
         persistence_prediction_dir=args.persistence_prediction_dir,

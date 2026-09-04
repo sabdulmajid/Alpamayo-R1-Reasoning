@@ -780,6 +780,7 @@ def verify_evaluation_partition(
     return {
         "selection": str(selection_file),
         "selection_sha256": sha256_file(selection_file),
+        "selection_fingerprint": fingerprint,
         "checkpoint": str(checkpoint_path),
         "checkpoint_sha256": expected_checkpoint_sha256,
         "test_manifest": str(test_manifest.expanduser().resolve()),

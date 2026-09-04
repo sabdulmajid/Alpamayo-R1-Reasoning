@@ -9,7 +9,7 @@ from src.world_model.evaluate_selection import (
     cluster_bootstrap_interval,
     evaluate_selection,
 )
-from src.world_model.runtime import sha256_file
+from src.world_model.runtime import canonical_fingerprint, sha256_file
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -20,7 +20,12 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 class SelectionFixture:
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        collision_exposure: tuple[float, float] = (0.5, 0.1),
+    ) -> None:
         self.root = root
         self.candidate_dir = root / "candidates"
         (self.candidate_dir / "records").mkdir(parents=True)
@@ -39,6 +44,7 @@ class SelectionFixture:
         self.oracle_rows: list[dict] = []
         self.rerank_rows: list[dict] = []
         self.persistence_rows: list[dict] = []
+        self.collision_exposure = collision_exposure
 
         for index in range(4):
             self._add_clip(
@@ -71,6 +77,71 @@ class SelectionFixture:
                     "artifact_path": str(self.oracle_dir / "unused-validation.npz"),
                 }
             ],
+        )
+        self.protocol = root / "protocol.json"
+        split_rows = {
+            "test": self.test_rows,
+            "train": [
+                json.loads(self.train_manifest.read_text(encoding="utf-8").strip())
+            ],
+            "val": [
+                json.loads(self.validation_manifest.read_text(encoding="utf-8").strip())
+            ],
+        }
+        split_paths = {
+            "test": self.test_manifest,
+            "train": self.train_manifest,
+            "val": self.validation_manifest,
+        }
+        protocol_payload = {
+            "schema_version": 1,
+            "status": "frozen_before_test_evaluation",
+            "source_data": {
+                "merged_oracle_manifest": str(self.oracle_manifest.resolve()),
+                "merged_oracle_manifest_sha256": sha256_file(self.oracle_manifest),
+            },
+            "split": {
+                "unit": "chunk_id",
+                "manifests": {
+                    name: {
+                        "path": str(split_paths[name].resolve()),
+                        "sha256": sha256_file(split_paths[name]),
+                        "clips": len(rows),
+                        "chunks": len({str(row["chunk_id"]) for row in rows}),
+                        "dataset_fingerprint": canonical_fingerprint(rows),
+                    }
+                    for name, rows in split_rows.items()
+                },
+            },
+            "training": {},
+            "forecast_evaluation": {},
+            "trajectory_selection": {
+                "primary_outcome": "collision_exposure",
+                "baseline": "candidate_0",
+                "learned_comparator": "persistence_selected",
+                "reranker_weights": self.rerank_rows[0]["weights"],
+            },
+            "uncertainty": {
+                "method": "paired_cluster_bootstrap_percentile",
+                "cluster_unit": "chunk_id",
+                "confidence_level": 0.95,
+                "bootstrap_seed": 17,
+                "bootstrap_replicates": 200,
+            },
+            "acceptance_gates": {
+                "forecast": {},
+                "selection": {
+                    "candidate_0_collision_exposure_relative_reduction_minimum": 0.15,
+                    "learned_collision_exposure_no_worse_than_persistence": True,
+                    "ade_degradation_m_paired_ci_95_upper_maximum": 0.2,
+                    "out_of_bounds_fraction_no_higher_than_candidate_0": True,
+                    "observed_fraction_no_lower_than_candidate_0": True,
+                },
+            },
+        }
+        protocol_payload["protocol_fingerprint"] = canonical_fingerprint(protocol_payload)
+        self.protocol.write_text(
+            json.dumps(protocol_payload, sort_keys=True) + "\n", encoding="utf-8"
         )
 
     def _add_clip(self, clip_id: str, t0_us: int, chunk_id: str) -> None:
@@ -149,7 +220,9 @@ class SelectionFixture:
             oracle_config_fingerprint=np.asarray("b" * 64),
             dataset_revision=np.asarray("dataset-revision"),
             candidate_xyz=pred_xyz,
-            candidate_collision_exposure=np.array([0.5, 0.1], dtype=np.float32),
+            candidate_collision_exposure=np.array(
+                self.collision_exposure, dtype=np.float32
+            ),
             candidate_collision_cells=np.array([6, 1], dtype=np.int32),
             candidate_conflict_horizons=np.array([2, 1], dtype=np.int16),
             candidate_out_of_bounds_horizons=np.array([0, 0], dtype=np.int16),
@@ -265,6 +338,7 @@ class SelectionFixture:
 
     def evaluate(self) -> tuple[dict, list[dict]]:
         return evaluate_selection(
+            protocol=self.protocol,
             test_manifest=self.test_manifest,
             train_manifest=self.train_manifest,
             validation_manifest=self.validation_manifest,
@@ -298,6 +372,7 @@ class HeldOutSelectionEvaluationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = SelectionFixture(Path(temporary))
             summary, per_clip = fixture.evaluate()
+            protocol_sha256 = sha256_file(fixture.protocol)
         self.assertEqual(summary["evaluation"]["clips"], 4)
         self.assertEqual(summary["evaluation"]["source_chunks"], 2)
         self.assertEqual(summary["evaluation"]["candidate_count"], 2)
@@ -369,6 +444,102 @@ class HeldOutSelectionEvaluationTest(unittest.TestCase):
             ],
             1.0,
         )
+        self.assertTrue(summary["acceptance_gates"]["all_passed"])
+        reduction = summary["acceptance_gates"]["decisions"][
+            "candidate_0_collision_exposure_relative_reduction_minimum"
+        ]
+        self.assertAlmostEqual(reduction["relative_reduction"], 0.8)
+        self.assertEqual(summary["protocol"]["sha256"], protocol_sha256)
+        self.assertFalse(
+            summary["evaluation"]["uncertainty_scope"][
+                "training_seed_variability_included"
+            ]
+        )
+
+    def test_zero_baseline_exposure_fails_relative_reduction_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SelectionFixture(
+                Path(temporary), collision_exposure=(0.0, 0.1)
+            )
+            summary, _ = fixture.evaluate()
+        decision = summary["acceptance_gates"]["decisions"][
+            "candidate_0_collision_exposure_relative_reduction_minimum"
+        ]
+        self.assertFalse(decision["passed"])
+        self.assertIsNone(decision["relative_reduction"])
+        self.assertIn("zero mean collision exposure", decision["reason"])
+        self.assertFalse(summary["acceptance_gates"]["all_passed"])
+
+    def test_protocol_fingerprint_and_configuration_drift_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SelectionFixture(Path(temporary))
+            payload = json.loads(fixture.protocol.read_text(encoding="utf-8"))
+            payload["uncertainty"]["bootstrap_seed"] = 18
+            fixture.protocol.write_text(
+                json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "fingerprint"):
+                fixture.evaluate()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SelectionFixture(Path(temporary))
+            with self.assertRaisesRegex(ValueError, "Bootstrap bootstrap_seed"):
+                evaluate_selection(
+                    protocol=fixture.protocol,
+                    test_manifest=fixture.test_manifest,
+                    train_manifest=fixture.train_manifest,
+                    validation_manifest=fixture.validation_manifest,
+                    oracle_manifest=fixture.oracle_manifest,
+                    learned_selections=fixture.learned_selections,
+                    persistence_selections=fixture.persistence_selections,
+                    candidate_dir=fixture.candidate_dir,
+                    bootstrap_replicates=200,
+                    bootstrap_seed=18,
+                )
+
+    def test_protocol_binds_exact_test_manifest_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SelectionFixture(Path(temporary))
+            copy = fixture.root / "copied-test.jsonl"
+            copy.write_bytes(fixture.test_manifest.read_bytes())
+            with self.assertRaisesRegex(ValueError, "test manifest path differs"):
+                evaluate_selection(
+                    protocol=fixture.protocol,
+                    test_manifest=copy,
+                    train_manifest=fixture.train_manifest,
+                    validation_manifest=fixture.validation_manifest,
+                    oracle_manifest=fixture.oracle_manifest,
+                    learned_selections=fixture.learned_selections,
+                    persistence_selections=fixture.persistence_selections,
+                    candidate_dir=fixture.candidate_dir,
+                    bootstrap_replicates=200,
+                    bootstrap_seed=17,
+                )
+            copied_oracle = fixture.root / "copied-oracle.jsonl"
+            copied_oracle.write_bytes(fixture.oracle_manifest.read_bytes())
+            with self.assertRaisesRegex(ValueError, "Oracle manifest path differs"):
+                evaluate_selection(
+                    protocol=fixture.protocol,
+                    test_manifest=fixture.test_manifest,
+                    train_manifest=fixture.train_manifest,
+                    validation_manifest=fixture.validation_manifest,
+                    oracle_manifest=copied_oracle,
+                    learned_selections=fixture.learned_selections,
+                    persistence_selections=fixture.persistence_selections,
+                    candidate_dir=fixture.candidate_dir,
+                    bootstrap_replicates=200,
+                    bootstrap_seed=17,
+                )
+
+    def test_protocol_binds_exact_reranker_weights(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SelectionFixture(Path(temporary))
+            for row in fixture.rerank_rows + fixture.persistence_rows:
+                row["weights"]["collision"] = 9.0
+            _write_jsonl(fixture.learned_selections, fixture.rerank_rows)
+            _write_jsonl(fixture.persistence_selections, fixture.persistence_rows)
+            with self.assertRaisesRegex(ValueError, "trajectory_selection"):
+                fixture.evaluate()
 
     def test_test_train_chunk_leakage_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

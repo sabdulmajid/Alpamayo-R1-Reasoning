@@ -356,6 +356,10 @@ class CheckpointSelectionTest(unittest.TestCase):
                 encoding="utf-8",
             )
             verification = verify_evaluation_partition(result_path, test_manifest)
+            self.assertEqual(
+                verification["selection_fingerprint"],
+                result["selection_fingerprint"],
+            )
             self.assertEqual(verification["train_test_chunk_overlap"], 0)
             self.assertEqual(verification["validation_test_chunk_overlap"], 0)
 
