@@ -146,6 +146,7 @@ case "${ACTION}" in
             --output "${RUN_DIR}/protocol.json"
         ;;
     train)
+        require_file "${RUN_DIR}/protocol.json"
         require_file "${TRAIN_MANIFEST}"
         require_file "${VAL_MANIFEST}"
         TRAIN_SEED=${BENCHMARK_TRAIN_SEED:?Set BENCHMARK_TRAIN_SEED for train}
@@ -154,6 +155,7 @@ case "${ACTION}" in
         verify_cuda
         COMMAND=(
             "${PYTHON_BIN}" -m src.world_model.train
+            --protocol "${RUN_DIR}/protocol.json"
             --train-manifest "${TRAIN_MANIFEST}"
             --val-manifest "${VAL_MANIFEST}"
             --output-dir "${TRAIN_OUTPUT}"
@@ -185,6 +187,7 @@ case "${ACTION}" in
             --output "${EVALUATION_AUDIT}"
         ;;
     evaluate-learned)
+        require_file "${RUN_DIR}/protocol.json"
         require_file "${SELECTION}"
         require_file "${EVALUATION_AUDIT}"
         require_file "${TEST_MANIFEST}"
@@ -196,6 +199,7 @@ case "${ACTION}" in
         prepare_prediction_directory "${PREDICTIONS}"
         verify_cuda
         srun --nodes=1 --ntasks=1 "${PYTHON_BIN}" -m src.world_model.evaluate \
+            --protocol "${RUN_DIR}/protocol.json" \
             --manifest "${TEST_MANIFEST}" \
             --method learned \
             --data-role test \

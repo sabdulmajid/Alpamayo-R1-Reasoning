@@ -14,11 +14,13 @@ REPO_ROOT="${WORLD_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 PYTHON_BIN="${WORLD_PYTHON_BIN:-python}"
 TRAIN_MANIFEST="${WORLD_TRAIN_MANIFEST:?Set WORLD_TRAIN_MANIFEST to train.jsonl}"
 VAL_MANIFEST="${WORLD_VAL_MANIFEST:?Set WORLD_VAL_MANIFEST to val.jsonl}"
+PROTOCOL="${WORLD_PROTOCOL:?Set WORLD_PROTOCOL to protocol.json}"
 OUTPUT_DIR="${WORLD_OUTPUT_DIR:?Set WORLD_OUTPUT_DIR to a checkpoint directory}"
 
 cd "$REPO_ROOT"
 test -r "$TRAIN_MANIFEST"
 test -r "$VAL_MANIFEST"
+test -r "$PROTOCOL"
 mkdir -p "$OUTPUT_DIR"
 srun --nodes=1 --ntasks=1 "$PYTHON_BIN" - <<'PY'
 import torch
@@ -31,6 +33,7 @@ nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv
 
 COMMAND=(
     "$PYTHON_BIN" -m src.world_model.train
+    --protocol "$PROTOCOL"
     --train-manifest "$TRAIN_MANIFEST"
     --val-manifest "$VAL_MANIFEST"
     --output-dir "$OUTPUT_DIR"
