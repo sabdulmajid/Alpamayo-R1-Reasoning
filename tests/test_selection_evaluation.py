@@ -8,13 +8,23 @@ from unittest import mock
 import numpy as np
 import torch
 
+from src.world_model.compare_forecasts import compare_forecasts
 from src.world_model.evaluate_selection import (
     cluster_bootstrap_interval,
     evaluate_selection,
     main,
 )
 from src.world_model.rerank import RerankWeights, rerank_artifacts
-from src.world_model.runtime import canonical_fingerprint, sha256_file
+from src.world_model.runtime import (
+    canonical_fingerprint,
+    prediction_filename,
+    sha256_file,
+)
+
+
+FORECAST_AP_BINS = 10
+FORECAST_BOOTSTRAP_REPLICATES = 200
+FORECAST_BOOTSTRAP_SEED = 17
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -37,8 +47,10 @@ class SelectionFixture:
         (self.candidate_dir / "artifacts").mkdir()
         self.oracle_dir = root / "oracles"
         self.oracle_dir.mkdir()
-        self.prediction_dir = root / "predictions"
-        self.prediction_dir.mkdir()
+        self.learned_prediction_dir = root / "learned_predictions"
+        self.learned_prediction_dir.mkdir()
+        self.persistence_prediction_dir = root / "persistence_predictions"
+        self.persistence_prediction_dir.mkdir()
         self.test_manifest = root / "test.jsonl"
         self.train_manifest = root / "train.jsonl"
         self.validation_manifest = root / "validation.jsonl"
@@ -144,7 +156,14 @@ class SelectionFixture:
                 "checkpoint_selection": "minimum_best_validation_loss",
                 "test_metrics_used_for_selection": False,
             },
-            "forecast_evaluation": {},
+            "forecast_evaluation": {
+                "metrics": ["average_precision", "brier", "iou"],
+                "short_horizons_s": [0.5, 1.0, 2.0],
+                "probability_threshold": 0.5,
+                "average_precision_bins": FORECAST_AP_BINS,
+                "post_test_threshold_tuning": False,
+                "comparison": "learned_minus_persistence",
+            },
             "trajectory_selection": {
                 "primary_outcome": "collision_exposure",
                 "baseline": "candidate_0",
@@ -158,8 +177,8 @@ class SelectionFixture:
                 "method": "paired_cluster_bootstrap_percentile",
                 "cluster_unit": "chunk_id",
                 "confidence_level": 0.95,
-                "bootstrap_seed": 17,
-                "bootstrap_replicates": 200,
+                "bootstrap_seed": FORECAST_BOOTSTRAP_SEED,
+                "bootstrap_replicates": FORECAST_BOOTSTRAP_REPLICATES,
             },
             "acceptance_gates": {
                 "forecast": {
@@ -185,66 +204,21 @@ class SelectionFixture:
         self._write_predictions_and_selections(protocol_payload)
         _write_jsonl(self.learned_selections, self.rerank_rows)
         _write_jsonl(self.persistence_selections, self.persistence_rows)
-        self._write_forecast_comparison(protocol_payload)
+        self._write_forecast_comparison()
 
-    def _write_forecast_comparison(self, protocol_payload: dict) -> None:
-        learned = {"average_precision": 0.8, "brier": 0.1, "iou": 0.6}
-        persistence = {"average_precision": 0.7, "brier": 0.2, "iou": 0.5}
-        differences = {
-            metric: learned[metric] - persistence[metric] for metric in learned
-        }
-        rules = protocol_payload["acceptance_gates"]["forecast"]
-        report = {
-            "schema_version": 1,
-            "comparison": "learned_minus_persistence",
-            "protocol": {
-                "path": str(self.protocol.resolve()),
-                "sha256": sha256_file(self.protocol),
-                "protocol_fingerprint": protocol_payload["protocol_fingerprint"],
-            },
-            "inputs": {
-                "manifest": {
-                    "manifest_path": str(self.test_manifest.resolve()),
-                    "manifest_sha256": sha256_file(self.test_manifest),
-                    "dataset_fingerprint": canonical_fingerprint(
-                        [
-                            {
-                                "artifact_sha256": row["artifact_sha256"],
-                                "chunk_id": row["chunk_id"],
-                                "clip_id": row["clip_id"],
-                                "t0_us": row["t0_us"],
-                            }
-                            for row in self.test_rows
-                        ]
-                    ),
-                    "clips": len(self.test_rows),
-                    "chunks": len({row["chunk_id"] for row in self.test_rows}),
-                }
-            },
-            "metrics": {
-                "learned": {"short_horizon": learned},
-                "persistence": {"short_horizon": persistence},
-            },
-            "paired_differences": {
-                "short_horizon": {
-                    metric: {"estimate": difference}
-                    for metric, difference in differences.items()
-                }
-            },
-            "acceptance_gates": {
-                "all_passed": True,
-                "decisions": {
-                    metric: {
-                        "rule": rules[metric],
-                        "passed": True,
-                        "learned": learned[metric],
-                        "persistence": persistence[metric],
-                        "learned_minus_persistence": differences[metric],
-                    }
-                    for metric in rules
-                },
-            },
-        }
+    def _write_forecast_comparison(self) -> None:
+        report = compare_forecasts(
+            protocol=self.protocol,
+            manifest=self.test_manifest,
+            selection_record=self.selection_path,
+            evaluation_audit=self.audit_path,
+            learned_prediction_dir=self.learned_prediction_dir,
+            persistence_prediction_dir=self.persistence_prediction_dir,
+            threshold=0.5,
+            ap_bins=FORECAST_AP_BINS,
+            bootstrap_replicates=FORECAST_BOOTSTRAP_REPLICATES,
+            bootstrap_seed=FORECAST_BOOTSTRAP_SEED,
+        )
         self.forecast_comparison.write_text(
             json.dumps(report, sort_keys=True) + "\n", encoding="utf-8"
         )
@@ -304,7 +278,10 @@ class SelectionFixture:
 
         oracle_path = self.oracle_dir / f"{clip_id}.npz"
         past = np.zeros((2, 6, 6), dtype=np.uint8)
-        future = np.zeros((2, 6, 6), dtype=np.uint8)
+        future = np.zeros((3, 6, 6), dtype=np.uint8)
+        future[0, 0, 3] = 1
+        future[1, 4, 4] = 1
+        future[2, 0, 4] = 1
         np.savez_compressed(
             oracle_path,
             schema_version=np.int16(4),
@@ -315,7 +292,7 @@ class SelectionFixture:
             occupancy=future,
             observed=np.ones_like(future),
             history_offsets_s=np.array([-1.0, 0.0], dtype=np.float32),
-            horizons_s=np.array([1.0, 2.0], dtype=np.float32),
+            horizons_s=np.array([0.5, 1.0, 2.0], dtype=np.float32),
             bev_x_min_m=np.float32(-2.0),
             bev_x_max_m=np.float32(4.0),
             bev_y_min_m=np.float32(-3.0),
@@ -363,9 +340,9 @@ class SelectionFixture:
         }
         data_schema = {
             "input_shape": [2, 6, 6],
-            "target_shape": [2, 6, 6],
+            "target_shape": [3, 6, 6],
             "past_horizons_s": [-1.0, 0.0],
-            "horizons_s": [1.0, 2.0],
+            "horizons_s": [0.5, 1.0, 2.0],
             "grid_origin_xy_m": [-2.0, -3.0],
             "resolution_m": 1.0,
             "coordinate_frame": "ego_at_t0",
@@ -579,12 +556,14 @@ class SelectionFixture:
             "validation_test_chunk_overlap": 0,
         }
         weights = RerankWeights()
-        learned_probability = np.zeros((2, 6, 6), dtype=np.float32)
+        learned_probability = np.zeros((3, 6, 6), dtype=np.float32)
         learned_probability[0, 0, 3] = 0.9
         learned_probability[1, 4, 4] = 0.9
-        persistence_probability = np.zeros((2, 6, 6), dtype=np.float32)
+        learned_probability[2, 0, 4] = 0.9
+        persistence_probability = np.zeros((3, 6, 6), dtype=np.float32)
         persistence_probability[0, 3, 3] = 0.9
         persistence_probability[1, 3, 4] = 0.9
+        persistence_probability[2, 3, 5] = 0.9
         for row in self.test_rows:
             clip_id = row["clip_id"]
             t0_us = row["t0_us"]
@@ -635,8 +614,13 @@ class SelectionFixture:
                     "data_schema": data_schema,
                 }
                 run_fingerprint = canonical_fingerprint(prediction_run)
-                prediction_path = (
-                    self.prediction_dir / f"{clip_id}.{method}.prediction.npz"
+                prediction_root = (
+                    self.learned_prediction_dir
+                    if learned
+                    else self.persistence_prediction_dir
+                )
+                prediction_path = prediction_root / prediction_filename(
+                    clip_id, t0_us
                 )
                 np.savez_compressed(
                     prediction_path,
@@ -644,7 +628,7 @@ class SelectionFixture:
                     clip_id=np.asarray(clip_id),
                     t0_us=np.int64(t0_us),
                     occupancy_prob=probability,
-                    horizons_s=np.array([1.0, 2.0], dtype=np.float32),
+                    horizons_s=np.array([0.5, 1.0, 2.0], dtype=np.float32),
                     grid_origin_xy_m=np.array([-2.0, -3.0], dtype=np.float32),
                     resolution_m=np.float32(1.0),
                     coordinate_frame=np.asarray("ego_at_t0"),
@@ -814,7 +798,7 @@ class HeldOutSelectionEvaluationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = SelectionFixture(Path(temporary))
             with mock.patch(
-                "src.world_model.evaluate_selection.torch.load", wraps=torch.load
+                "src.world_model.prediction_auth.torch.load", wraps=torch.load
             ) as load_checkpoint:
                 fixture.evaluate()
         load_checkpoint.assert_called_once()
@@ -1141,7 +1125,9 @@ class HeldOutSelectionEvaluationTest(unittest.TestCase):
             np.savez_compressed(prediction_path, **arrays)
             row["prediction_sha256"] = sha256_file(prediction_path)
             _write_jsonl(fixture.learned_selections, fixture.rerank_rows)
-            with self.assertRaisesRegex(ValueError, "missing prediction_run_json"):
+            with self.assertRaisesRegex(
+                ValueError, r"missing \['prediction_run_json'\]"
+            ):
                 fixture.evaluate()
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -1168,7 +1154,7 @@ class HeldOutSelectionEvaluationTest(unittest.TestCase):
                 prediction_run["evaluation_binding"]["checkpoint_selection"]["path"]
             )
             selection_path.write_text("{}\n", encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "selection SHA-256 does not match"):
+            with self.assertRaisesRegex(ValueError, "Invalid checkpoint selection"):
                 fixture.evaluate()
 
     def test_forecast_comparison_provenance_is_required_exactly(self) -> None:
@@ -1244,7 +1230,7 @@ class HeldOutSelectionEvaluationTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, expected_error):
                     fixture.evaluate()
 
-    def test_combined_gate_fails_when_forecast_gate_fails(self) -> None:
+    def test_rejects_forged_forecast_gate_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = SelectionFixture(Path(temporary))
             report = json.loads(fixture.forecast_comparison.read_text(encoding="utf-8"))
@@ -1260,14 +1246,82 @@ class HeldOutSelectionEvaluationTest(unittest.TestCase):
             fixture.forecast_comparison.write_text(
                 json.dumps(report, sort_keys=True) + "\n", encoding="utf-8"
             )
-            summary, _ = fixture.evaluate()
-        self.assertFalse(summary["benchmark_acceptance"]["all_passed"])
-        self.assertFalse(
-            summary["benchmark_acceptance"]["components"]["forecast"]["all_passed"]
+            with self.assertRaisesRegex(ValueError, "deterministic recomputation"):
+                fixture.evaluate()
+
+    def test_rejects_forged_favorable_forecast_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SelectionFixture(Path(temporary))
+            report = json.loads(fixture.forecast_comparison.read_text(encoding="utf-8"))
+            learned = report["metrics"]["learned"]["short_horizon"]
+            persistence = report["metrics"]["persistence"]["short_horizon"]
+            learned["average_precision"] = 0.99
+            persistence["average_precision"] = 0.01
+            difference = 0.98
+            report["paired_differences"]["short_horizon"]["average_precision"][
+                "estimate"
+            ] = difference
+            decision = report["acceptance_gates"]["decisions"][
+                "average_precision"
+            ]
+            decision.update(
+                {
+                    "learned": 0.99,
+                    "persistence": 0.01,
+                    "learned_minus_persistence": difference,
+                    "passed": True,
+                }
+            )
+            report["acceptance_gates"]["all_passed"] = True
+            fixture.forecast_comparison.write_text(
+                json.dumps(report, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "deterministic recomputation"):
+                fixture.evaluate()
+
+    def test_rejects_forged_forecast_prediction_provenance(self) -> None:
+        cases = (
+            (
+                "prediction set",
+                lambda learned: learned.__setitem__(
+                    "prediction_set_fingerprint", "f" * 64
+                ),
+            ),
+            (
+                "run",
+                lambda learned: learned.__setitem__(
+                    "prediction_run_fingerprint", "f" * 64
+                ),
+            ),
+            (
+                "checkpoint",
+                lambda learned: learned.__setitem__("checkpoint_sha256", "f" * 64),
+            ),
+            (
+                "selection",
+                lambda learned: learned["authenticated_run"][
+                    "checkpoint_selection"
+                ].__setitem__("sha256", "f" * 64),
+            ),
+            (
+                "audit",
+                lambda learned: learned["authenticated_run"][
+                    "evaluation_audit"
+                ].__setitem__("sha256", "f" * 64),
+            ),
         )
-        self.assertTrue(
-            summary["benchmark_acceptance"]["components"]["selection"]["all_passed"]
-        )
+        for name, mutate in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                fixture = SelectionFixture(Path(temporary))
+                report = json.loads(
+                    fixture.forecast_comparison.read_text(encoding="utf-8")
+                )
+                mutate(report["inputs"]["predictions"]["learned"])
+                fixture.forecast_comparison.write_text(
+                    json.dumps(report, sort_keys=True) + "\n", encoding="utf-8"
+                )
+                with self.assertRaisesRegex(ValueError, "deterministic recomputation"):
+                    fixture.evaluate()
 
     def test_test_train_chunk_leakage_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
