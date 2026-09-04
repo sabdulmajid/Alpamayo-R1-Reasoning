@@ -102,6 +102,10 @@ The dataset is pinned to revision
 `2ae73f49ffd2b5db43b404201beb7b92889f7afc`. Override it only when deliberately
 regenerating all derived artifacts.
 
+The reader also puts this revision in each streamed file path. This prevents a
+stream from reading the current `main` version while metadata comes from the
+pinned revision.
+
 For SLURM, export the Python executable and any non-default paths before
 submission. The array assigns an entire PhysicalAI-AV source chunk to one shard
 using `chunk_id % num_shards`, avoiding cross-shard archive overlap.

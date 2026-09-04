@@ -27,6 +27,8 @@ import pandas as pd
 from scipy.ndimage import distance_transform_edt
 from scipy.spatial.transform import Rotation
 
+from src.revision_pinned_dataset import pin_streaming_revision
+
 
 DATASET_REVISION = "2ae73f49ffd2b5db43b404201beb7b92889f7afc"
 LIDAR_FEATURE = "lidar_top_360fov"
@@ -893,6 +895,7 @@ def oracle_config_payload(
     """Return every parameter that changes an oracle artifact."""
 
     return {
+        "dataset_access_mode": "revision-qualified-streaming",
         "horizons_s": [float(value) for value in horizons_s],
         "history_offsets_s": [float(value) for value in history_offsets_s],
         "bev": asdict(bev_config),
@@ -1633,10 +1636,13 @@ def run_shard(args: argparse.Namespace) -> Path:
     )
     oracle_fingerprint = config_fingerprint(oracle_config)
     candidate_index = load_candidate_record_index(Path(args.candidate_dir))
-    avdi = physical_ai_av.PhysicalAIAVDatasetInterface(
-        revision=args.dataset_revision,
-        cache_dir=args.cache_dir,
-        confirm_download_threshold_gb=float("inf"),
+    avdi = pin_streaming_revision(
+        physical_ai_av.PhysicalAIAVDatasetInterface(
+            revision=args.dataset_revision,
+            cache_dir=args.cache_dir,
+            confirm_download_threshold_gb=float("inf"),
+        ),
+        args.dataset_revision,
     )
     clips = validate_clip_frame(pd.read_parquet(args.clip_parquet))
     clips["chunk_id"] = [avdi.get_clip_chunk(clip_id) for clip_id in clips["clip_id"]]
