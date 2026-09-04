@@ -106,6 +106,11 @@ The reader also puts this revision in each streamed file path. This prevents a
 stream from reading the current `main` version while metadata comes from the
 pinned revision.
 
+This revision stores one `reference_timestamp` for each LiDAR spin. It does not
+store per-point timestamps. The oracle transforms all points in a spin with the
+ego pose at that reference timestamp. This rigid-spin approximation can retain
+motion distortion during one 100 ms scan.
+
 For SLURM, export the Python executable and any non-default paths before
 submission. The array assigns an entire PhysicalAI-AV source chunk to one shard
 using `chunk_id % num_shards`, avoiding cross-shard archive overlap.

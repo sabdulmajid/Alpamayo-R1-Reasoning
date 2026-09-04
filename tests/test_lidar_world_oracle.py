@@ -1,6 +1,8 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -9,10 +11,12 @@ from src.lidar_world_oracle import (
     BEVConfig,
     CandidateArtifactRef,
     ClipOracleResult,
+    REFERENCE_TIMESTAMP_MODE,
     PointFilterConfig,
     VehicleDimensions,
     atomic_save_npz,
     config_fingerprint,
+    decode_lidar_spin,
     evaluate_candidate_risks,
     file_sha256,
     filter_ego_returns,
@@ -133,6 +137,35 @@ class RasterTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "No LiDAR spin"):
             select_spin_rows(frame, t0_us=0, horizons_s=[1.4], tolerance_s=0.1)
+
+    def test_reference_timestamp_schema_uses_rigid_spin_pose(self):
+        frame = pd.DataFrame(
+            {
+                "reference_timestamp": [900_000, 1_900_000, 2_900_000],
+                "draco_encoded_pointcloud": [b"first", b"second", b"third"],
+            }
+        )
+        selected = select_spin_rows(
+            frame,
+            t0_us=0,
+            horizons_s=[1.0, 3.0],
+            tolerance_s=0.11,
+            timestamp_mode=REFERENCE_TIMESTAMP_MODE,
+        )
+        self.assertEqual(
+            [int(row.reference_timestamp) for row in selected],
+            [900_000, 2_900_000],
+        )
+        cloud = SimpleNamespace(
+            points=np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+            attributes=[],
+        )
+        with mock.patch("DracoPy.decode", return_value=cloud):
+            spin = decode_lidar_spin(
+                selected[0], timestamp_mode=REFERENCE_TIMESTAMP_MODE
+            )
+        np.testing.assert_array_equal(spin.point_timestamps_us, [900_000, 900_000])
+        self.assertEqual(spin.midpoint_timestamp_us, 900_000)
 
 
 class CollisionTests(unittest.TestCase):
