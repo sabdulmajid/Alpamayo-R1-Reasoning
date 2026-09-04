@@ -24,6 +24,7 @@ from .protocol import (
     validate_manifest_binding,
     validate_uncertainty_configuration,
 )
+from .prediction_auth import authenticate_prediction_run, load_prediction_run
 from .runtime import (
     canonical_fingerprint,
     prediction_filename,
@@ -43,6 +44,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--protocol", required=True, help="Frozen benchmark protocol JSON")
     parser.add_argument("--manifest", required=True, help="Frozen test JSONL manifest")
+    parser.add_argument(
+        "--selection-record",
+        required=True,
+        help="Checkpoint-selection JSON used to produce the learned predictions",
+    )
+    parser.add_argument(
+        "--evaluation-audit",
+        required=True,
+        help="Zero-overlap evaluation-partition audit for the learned predictions",
+    )
     parser.add_argument("--learned-prediction-dir", required=True)
     parser.add_argument("--persistence-prediction-dir", required=True)
     parser.add_argument("--output", required=True, help="Comparison JSON path")
@@ -335,6 +346,7 @@ def _load_prediction(
         "source_artifact_sha256",
         "producer_method",
         "checkpoint_sha256",
+        "prediction_run_json",
         "prediction_run_fingerprint",
     }
     with np.load(path, allow_pickle=False) as archive:
@@ -346,7 +358,8 @@ def _load_prediction(
         t0_us = int(_scalar(archive, "t0_us"))
         producer_method = str(_scalar(archive, "producer_method"))
         checkpoint_sha256 = str(_scalar(archive, "checkpoint_sha256"))
-        run_fingerprint = str(_scalar(archive, "prediction_run_fingerprint"))
+        prediction_run = load_prediction_run(archive, artifact_path=path)
+        run_fingerprint = prediction_run.fingerprint
         source_sha256 = str(_scalar(archive, "source_artifact_sha256"))
         coordinate_frame = str(_scalar(archive, "coordinate_frame"))
         resolution_m = float(_scalar(archive, "resolution_m"))
@@ -372,6 +385,8 @@ def _load_prediction(
         _require_sha256(checkpoint_sha256, f"Learned checkpoint SHA-256 in {path}")
     elif checkpoint_sha256:
         raise ValueError(f"Persistence prediction claims a checkpoint: {path}")
+    if prediction_run.payload.get("checkpoint_sha256") != checkpoint_sha256:
+        raise ValueError(f"Prediction checkpoint differs from prediction_run_json: {path}")
     if source_sha256 != expected_record["artifact_sha256"]:
         raise ValueError(f"Prediction source oracle artifact SHA-256 differs for {identity}")
     target = oracle["future_occupancy"]
@@ -396,6 +411,8 @@ def _load_prediction(
         "source_artifact_sha256": source_sha256,
         "checkpoint_sha256": checkpoint_sha256 or None,
         "prediction_run_fingerprint": run_fingerprint,
+        "prediction_run_json": prediction_run.canonical_json,
+        "_prediction_run": prediction_run,
         "producer_method": producer_method,
     }
 
@@ -557,6 +574,8 @@ def compare_forecasts(
     manifest: str | Path,
     learned_prediction_dir: str | Path,
     persistence_prediction_dir: str | Path,
+    selection_record: str | Path,
+    evaluation_audit: str | Path,
     threshold: float = 0.5,
     ap_bins: int = 1000,
     bootstrap_replicates: int = 10_000,
@@ -647,9 +666,17 @@ def compare_forecasts(
             prediction_provenance[method].append(provenance)
 
     run_provenance: dict[str, Any] = {}
+    authentication_manifest_provenance = {
+        "artifact_count": manifest_provenance["clips"],
+        "chunk_ids": sorted({record["chunk_id"] for record in records}),
+        "dataset_fingerprint": manifest_provenance["dataset_fingerprint"],
+    }
     for method, entries in prediction_provenance.items():
         run_fingerprints = {entry["prediction_run_fingerprint"] for entry in entries}
+        run_json_records = {entry["prediction_run_json"] for entry in entries}
         checkpoints = {entry["checkpoint_sha256"] for entry in entries}
+        if len(run_json_records) != 1:
+            raise ValueError(f"{method} predictions do not share one canonical run payload")
         if len(run_fingerprints) != 1:
             raise ValueError(f"{method} predictions do not share one run fingerprint")
         if len(checkpoints) != 1:
@@ -657,10 +684,30 @@ def compare_forecasts(
         checkpoint = next(iter(checkpoints))
         if method == "learned" and checkpoint is None:
             raise AssertionError("Learned checkpoint validation was bypassed")
+        authenticated_run = authenticate_prediction_run(
+            entries[0]["_prediction_run"],
+            expected_method=method,
+            manifest=manifest_path,
+            protocol=protocol if method == "learned" else None,
+            selection_record=selection_record if method == "learned" else None,
+            evaluation_audit=evaluation_audit if method == "learned" else None,
+            manifest_provenance=authentication_manifest_provenance,
+        )
+        if authenticated_run["checkpoint_sha256"] != checkpoint:
+            raise ValueError(f"{method} artifact checkpoint differs from authenticated run")
+        public_entries = [
+            {
+                key: value
+                for key, value in entry.items()
+                if key not in {"_prediction_run", "prediction_run_json"}
+            }
+            for entry in entries
+        ]
         run_provenance[method] = {
             "directory": str(prediction_roots[method]),
             "prediction_run_fingerprint": next(iter(run_fingerprints)),
             "checkpoint_sha256": checkpoint,
+            "authenticated_run": authenticated_run,
             "prediction_set_fingerprint": canonical_fingerprint(
                 [
                     {
@@ -668,10 +715,10 @@ def compare_forecasts(
                         "t0_us": entry["t0_us"],
                         "sha256": entry["sha256"],
                     }
-                    for entry in entries
+                    for entry in public_entries
                 ]
             ),
-            "artifacts": entries,
+            "artifacts": public_entries,
         }
 
     chunks = [record["chunk_id"] for record in records]
@@ -742,6 +789,8 @@ def main() -> None:
     result = compare_forecasts(
         protocol=args.protocol,
         manifest=args.manifest,
+        selection_record=args.selection_record,
+        evaluation_audit=args.evaluation_audit,
         learned_prediction_dir=args.learned_prediction_dir,
         persistence_prediction_dir=args.persistence_prediction_dir,
         threshold=args.threshold,

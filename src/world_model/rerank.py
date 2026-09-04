@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 
 from .data import write_jsonl
+from .prediction_auth import authenticate_prediction_run, load_prediction_run
 from .runtime import prediction_filename, sha256_file
 
 
@@ -210,6 +211,8 @@ def rerank_artifacts(
     *,
     expected_clip_id: str | None = None,
     expected_t0_us: int | None = None,
+    expected_method: str | None = None,
+    include_run_record: bool = False,
 ) -> dict[str, Any]:
     candidate_sha256 = sha256_file(candidate_path)
     with np.load(prediction_path, allow_pickle=False) as prediction:
@@ -225,6 +228,7 @@ def rerank_artifacts(
             "source_artifact_sha256",
             "producer_method",
             "checkpoint_sha256",
+            "prediction_run_json",
             "prediction_run_fingerprint",
         }
         missing = sorted(required - set(prediction.files))
@@ -244,9 +248,10 @@ def rerank_artifacts(
         )
         producer_method = str(np.asarray(prediction["producer_method"]).reshape(()))
         checkpoint_sha256 = str(np.asarray(prediction["checkpoint_sha256"]).reshape(()))
-        prediction_run_fingerprint = str(
-            np.asarray(prediction["prediction_run_fingerprint"]).reshape(())
+        prediction_run = load_prediction_run(
+            prediction, artifact_path=prediction_path
         )
+        prediction_run_fingerprint = prediction_run.fingerprint
     if (
         probability.ndim != 3
         or not np.isfinite(probability).all()
@@ -311,12 +316,19 @@ def rerank_artifacts(
             raise ValueError(f"Prediction {name} is not a SHA-256 digest")
     if producer_method not in {"learned", "persistence"}:
         raise ValueError(f"Unsupported prediction producer_method: {producer_method!r}")
+    if expected_method is not None and producer_method != expected_method:
+        raise ValueError(
+            f"Prediction producer_method={producer_method!r} does not match "
+            f"--method={expected_method!r}"
+        )
     if producer_method == "learned" and (
         len(checkpoint_sha256) != 64 or not set(checkpoint_sha256).issubset(hex_characters)
     ):
         raise ValueError("Learned prediction has no valid checkpoint SHA-256")
     if producer_method == "persistence" and checkpoint_sha256:
         raise ValueError("Persistence prediction must not claim a checkpoint")
+    if prediction_run.payload.get("checkpoint_sha256") != checkpoint_sha256:
+        raise ValueError("Prediction checkpoint differs from prediction_run_json")
     if source_artifact_sha256 != candidate_sha256:
         raise ValueError(
             "Prediction source_artifact_sha256 does not match the candidate artifact bytes"
@@ -374,7 +386,7 @@ def rerank_artifacts(
         for index in range(trajectories.shape[0])
     ]
     world_index = int(np.argmin([score["score"] for score in scores]))
-    return {
+    result = {
         "candidate_count": len(scores),
         "clip_id": prediction_clip_id,
         "t0_us": prediction_t0_us,
@@ -388,12 +400,28 @@ def rerank_artifacts(
         "weights": asdict(weights),
         "candidate_scores": scores,
     }
+    if include_run_record:
+        result["_prediction_run"] = prediction_run
+        result["_prediction_run_json"] = prediction_run.canonical_json
+    return result
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True, help="Oracle candidate manifest")
+    parser.add_argument("--method", choices=("learned", "persistence"), required=True)
     parser.add_argument("--prediction-dir", help="Defaults to prediction_path in each manifest row")
+    parser.add_argument(
+        "--protocol", help="Frozen protocol JSON required for learned predictions"
+    )
+    parser.add_argument(
+        "--selection-record",
+        help="Checkpoint-selection JSON required for learned predictions",
+    )
+    parser.add_argument(
+        "--evaluation-audit",
+        help="Zero-overlap partition audit required for learned predictions",
+    )
     parser.add_argument("--output", required=True, help="Output JSONL")
     for field, default in asdict(RerankWeights()).items():
         parser.add_argument(f"--{field.replace('_', '-')}-weight", type=float, default=default)
@@ -402,6 +430,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    learned_records = (
+        ("--protocol", args.protocol),
+        ("--selection-record", args.selection_record),
+        ("--evaluation-audit", args.evaluation_audit),
+    )
+    if args.method == "learned":
+        missing = [flag for flag, value in learned_records if not value]
+        if missing:
+            raise ValueError(
+                "Learned prediction authentication requires " + " and ".join(missing)
+            )
+    elif any(value for _, value in learned_records):
+        raise ValueError(
+            "--protocol, --selection-record, and --evaluation-audit are only valid "
+            "for learned predictions"
+        )
     weights = RerankWeights(
         **{
             field: getattr(args, f"{field}_weight")
@@ -430,6 +474,8 @@ def main() -> None:
             weights,
             expected_clip_id=row["clip_id"],
             expected_t0_us=row["t0_us"],
+            expected_method=args.method,
+            include_run_record=True,
         )
         output_rows.append(
             {
@@ -439,6 +485,20 @@ def main() -> None:
                 **result,
             }
         )
+    canonical_runs = {row.pop("_prediction_run_json") for row in output_rows}
+    if len(canonical_runs) != 1:
+        raise ValueError("Predictions do not share one canonical run payload")
+    prediction_runs = [row.pop("_prediction_run") for row in output_rows]
+    authenticated_run = authenticate_prediction_run(
+        prediction_runs[0],
+        expected_method=args.method,
+        manifest=args.manifest,
+        protocol=args.protocol,
+        selection_record=args.selection_record,
+        evaluation_audit=args.evaluation_audit,
+    )
+    for row in output_rows:
+        row["prediction_run_provenance"] = authenticated_run
     write_jsonl(output_rows, args.output)
     print(f"Wrote world-aware selections for {len(rows)} clips to {args.output}")
 

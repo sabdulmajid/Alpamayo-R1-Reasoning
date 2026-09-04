@@ -488,8 +488,11 @@ class SyntheticPipelineTest(unittest.TestCase):
                 "src.world_model.rerank",
                 "--manifest",
                 str(manifests["test"]),
+                "--method",
+                "learned",
                 "--prediction-dir",
                 str(prediction_dir),
+                *learned_binding_arguments,
                 "--output",
                 str(reranked_path),
             )
@@ -498,6 +501,23 @@ class SyntheticPipelineTest(unittest.TestCase):
             self.assertNotIn("oracle_selected_index", reranked)
             self.assertEqual(len(reranked["prediction_sha256"]), 64)
             self.assertEqual(len(reranked["candidate_sha256"]), 64)
+            authenticated_run = reranked["prediction_run_provenance"]
+            self.assertEqual(authenticated_run["method"], "learned")
+            self.assertEqual(
+                authenticated_run["checkpoint_selection"]["sha256"],
+                sha256_file(selection_record),
+            )
+            self.assertEqual(
+                authenticated_run["evaluation_audit"]["sha256"],
+                sha256_file(evaluation_audit),
+            )
+            self.assertEqual(
+                authenticated_run["partition_isolation"],
+                {
+                    "train_evaluation_chunk_overlap": 0,
+                    "validation_evaluation_chunk_overlap": 0,
+                },
+            )
 
             with self.assertRaises(subprocess.CalledProcessError) as overlap_error:
                 run_module(

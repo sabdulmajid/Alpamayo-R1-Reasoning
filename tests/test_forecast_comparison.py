@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from src.world_model.compare_forecasts import compare_forecasts
 from src.world_model.runtime import canonical_fingerprint, prediction_filename, sha256_file
@@ -15,9 +16,6 @@ from src.world_model.runtime import canonical_fingerprint, prediction_filename, 
 
 HORIZONS = np.array([0.5, 1.0, 2.0], dtype=np.float32)
 ORIGIN = np.array([-1.0, -1.0], dtype=np.float32)
-CHECKPOINT = "a" * 64
-LEARNED_RUN = "b" * 64
-PERSISTENCE_RUN = "c" * 64
 REPOSITORY = Path(__file__).resolve().parents[1]
 TEST_AP_BINS = 10
 TEST_BOOTSTRAP_REPLICATES = 20
@@ -53,6 +51,7 @@ def write_prediction(
     *,
     method: str,
     probability: np.ndarray,
+    prediction_run: dict,
 ) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / prediction_filename(clip_id, t0_us)
@@ -68,10 +67,13 @@ def write_prediction(
         coordinate_frame=np.asarray("ego_at_t0"),
         source_artifact_sha256=np.asarray(sha256_file(oracle_path)),
         producer_method=np.asarray(method),
-        checkpoint_sha256=np.asarray(CHECKPOINT if method == "learned" else ""),
-        prediction_run_fingerprint=np.asarray(
-            LEARNED_RUN if method == "learned" else PERSISTENCE_RUN
+        checkpoint_sha256=np.asarray(prediction_run["checkpoint_sha256"]),
+        prediction_run_json=np.asarray(
+            json.dumps(
+                prediction_run, sort_keys=True, separators=(",", ":"), allow_nan=False
+            )
         ),
+        prediction_run_fingerprint=np.asarray(canonical_fingerprint(prediction_run)),
     )
     return path
 
@@ -83,6 +85,267 @@ def replace_array(path: Path, name: str, value: np.ndarray) -> None:
     np.savez_compressed(path, **arrays)
 
 
+def remove_array(path: Path, name: str) -> None:
+    with np.load(path, allow_pickle=False) as archive:
+        arrays = {key: archive[key] for key in archive.files if key != name}
+    np.savez_compressed(path, **arrays)
+
+
+def replace_prediction_run(path: Path, mutate) -> None:
+    with np.load(path, allow_pickle=False) as archive:
+        arrays = {key: archive[key] for key in archive.files}
+    run = json.loads(str(arrays["prediction_run_json"]))
+    mutate(run)
+    binding = run["evaluation_binding"]
+    binding.pop("binding_fingerprint", None)
+    binding["binding_fingerprint"] = canonical_fingerprint(binding)
+    arrays["prediction_run_json"] = np.asarray(
+        json.dumps(run, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    )
+    arrays["prediction_run_fingerprint"] = np.asarray(canonical_fingerprint(run))
+    np.savez_compressed(path, **arrays)
+
+
+def write_binding_records(
+    root: Path, protocol: Path, manifest: Path, *, clips: int, chunks: int,
+    dataset_fingerprint: str
+) -> tuple[Path, Path, dict, dict]:
+    protocol_payload = json.loads(protocol.read_text(encoding="utf-8"))
+    protocol_provenance = {
+        "path": str(protocol.resolve()),
+        "sha256": sha256_file(protocol),
+        "protocol_fingerprint": protocol_payload["protocol_fingerprint"],
+    }
+    training_configuration = {
+        "epochs": 1,
+        "batch_size": 1,
+        "workers": 0,
+        "base_channels": 2,
+        "automatic_mixed_precision": False,
+        "learning_rate": 0.001,
+        "weight_decay": 0.0,
+    }
+    resume_signature = {
+        "seed": 2026,
+        "train_manifest_sha256": "1" * 64,
+        "val_manifest_sha256": "2" * 64,
+        "batch_size": 1,
+        "base_channels": 2,
+        "amp": False,
+        "learning_rate": 0.001,
+        "weight_decay": 0.0,
+        "protocol": protocol_provenance,
+    }
+    checkpoint = {
+        "epoch": 0,
+        "seed": 2026,
+        "best_val_loss": 0.1,
+        "resume_signature": resume_signature,
+        "run_config": {
+            "epochs": 1,
+            "batch_size": 1,
+            "workers": 0,
+            "base_channels": 2,
+            "amp": False,
+            "learning_rate": 0.001,
+            "weight_decay": 0.0,
+        },
+        "model_config": {"base_channels": 2},
+        "data_schema": {},
+        "data_provenance": {
+            "train": {"dataset_fingerprint": "3" * 64},
+            "val": {"dataset_fingerprint": "4" * 64},
+        },
+    }
+    checkpoint_path = (root / "selected.pt").resolve()
+    torch.save(checkpoint, checkpoint_path)
+    other_checkpoint = (root / "other.pt").resolve()
+    other_checkpoint.write_bytes(b"other checkpoint")
+
+    def completion(path: Path, seed: int, name: str) -> tuple[Path, dict]:
+        record = {
+            "schema_version": 1,
+            "status": "completed",
+            "seed": seed,
+            "epochs": 1,
+            "final_epoch": 0,
+            "protocol": protocol_provenance,
+            "latest_checkpoint": str(path),
+            "latest_checkpoint_sha256": sha256_file(path),
+            "best_checkpoint": str(path),
+            "best_checkpoint_sha256": sha256_file(path),
+        }
+        record["completion_fingerprint"] = canonical_fingerprint(record)
+        record_path = root / f"{name}-completion.json"
+        record_path.write_text(
+            json.dumps(record, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return record_path.resolve(), record
+
+    selected_completion_path, selected_completion = completion(
+        checkpoint_path, 2026, "selected"
+    )
+    other_completion_path, other_completion = completion(
+        other_checkpoint, 2027, "other"
+    )
+    common_run = {
+        "epoch": 0,
+        "train_manifest_sha256": resume_signature["train_manifest_sha256"],
+        "validation_manifest_sha256": resume_signature["val_manifest_sha256"],
+        "train_dataset_fingerprint": "3" * 64,
+        "validation_dataset_fingerprint": "4" * 64,
+        "model_config": checkpoint["model_config"],
+        "data_schema": checkpoint["data_schema"],
+        "training_configuration": training_configuration,
+        "protocol": protocol_provenance,
+        "comparison_signature": {
+            key: value for key, value in resume_signature.items() if key != "seed"
+        },
+    }
+    selected_run = {
+        "label": "selected",
+        "seed": 2026,
+        "best_validation_loss": 0.1,
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_sha256": sha256_file(checkpoint_path),
+        "training_completion": {
+            "path": str(selected_completion_path),
+            "sha256": sha256_file(selected_completion_path),
+            "completion_fingerprint": selected_completion["completion_fingerprint"],
+            "latest_checkpoint": str(checkpoint_path),
+            "latest_checkpoint_sha256": sha256_file(checkpoint_path),
+        },
+        **common_run,
+    }
+    other_run = {
+        "label": "other",
+        "seed": 2027,
+        "best_validation_loss": 0.2,
+        "checkpoint": str(other_checkpoint),
+        "checkpoint_sha256": sha256_file(other_checkpoint),
+        "training_completion": {
+            "path": str(other_completion_path),
+            "sha256": sha256_file(other_completion_path),
+            "completion_fingerprint": other_completion["completion_fingerprint"],
+            "latest_checkpoint": str(other_checkpoint),
+            "latest_checkpoint_sha256": sha256_file(other_checkpoint),
+        },
+        **common_run,
+    }
+    selection = {
+        "schema_version": 2,
+        "selection_policy": "minimum_best_validation_loss",
+        "test_metrics_used": False,
+        "protocol": protocol_provenance,
+        "selected_label": "selected",
+        "selected_seed": 2026,
+        "selected_checkpoint": str(checkpoint_path),
+        "selected_checkpoint_sha256": sha256_file(checkpoint_path),
+        "selected_epoch": 0,
+        "selected_validation_loss": 0.1,
+        "runs": [selected_run, other_run],
+    }
+    selection["selection_fingerprint"] = canonical_fingerprint(selection)
+    selection_path = (root / "checkpoint_selection.json").resolve()
+    selection_path.write_text(
+        json.dumps(selection, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    audit = {
+        "selection": str(selection_path),
+        "selection_sha256": sha256_file(selection_path),
+        "selection_fingerprint": selection["selection_fingerprint"],
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_sha256": sha256_file(checkpoint_path),
+        "test_manifest": str(manifest.resolve()),
+        "test_manifest_sha256": sha256_file(manifest),
+        "test_clips": clips,
+        "test_chunks": chunks,
+        "train_test_chunk_overlap": 0,
+        "validation_test_chunk_overlap": 0,
+        "protocol": protocol_provenance,
+    }
+    audit_path = (root / "evaluation_partition.json").resolve()
+    audit_path.write_text(json.dumps(audit, sort_keys=True) + "\n", encoding="utf-8")
+    record_binding = {
+        "protocol": protocol_provenance,
+        "checkpoint_selection": {
+            "path": str(selection_path),
+            "sha256": sha256_file(selection_path),
+            "selection_fingerprint": selection["selection_fingerprint"],
+            "selected_label": "selected",
+            "selected_seed": 2026,
+            "selected_epoch": 0,
+            "selected_validation_loss": 0.1,
+        },
+        "evaluation_audit": {
+            "path": str(audit_path),
+            "sha256": sha256_file(audit_path),
+            "record_fingerprint": canonical_fingerprint(audit),
+            "selection_fingerprint": selection["selection_fingerprint"],
+            "train_test_chunk_overlap": 0,
+            "validation_test_chunk_overlap": 0,
+        },
+    }
+    evaluation_manifest = {
+        "path": str(manifest.resolve()),
+        "sha256": sha256_file(manifest),
+        "dataset_fingerprint": dataset_fingerprint,
+        "clips": clips,
+        "chunks": chunks,
+    }
+    learned_binding = {
+        "evaluation_manifest": evaluation_manifest,
+        "checkpoint": {
+            "path": str(checkpoint_path),
+            "sha256": sha256_file(checkpoint_path),
+            "epoch": 0,
+            "seed": 2026,
+            "train_manifest_sha256": "1" * 64,
+            "validation_manifest_sha256": "2" * 64,
+            "train_dataset_fingerprint": "3" * 64,
+            "validation_dataset_fingerprint": "4" * 64,
+        },
+        **record_binding,
+        "partition_isolation": {
+            "train_evaluation_chunk_overlap": 0,
+            "validation_evaluation_chunk_overlap": 0,
+        },
+    }
+    learned_binding["binding_fingerprint"] = canonical_fingerprint(learned_binding)
+    persistence_binding = {
+        "evaluation_manifest": evaluation_manifest,
+        "checkpoint": None,
+        "protocol": None,
+        "checkpoint_selection": None,
+        "evaluation_audit": None,
+        "partition_isolation": {
+            "train_evaluation_chunk_overlap": None,
+            "validation_evaluation_chunk_overlap": None,
+        },
+    }
+    persistence_binding["binding_fingerprint"] = canonical_fingerprint(
+        persistence_binding
+    )
+    common_prediction_run = {
+        "data_role": "test",
+        "amp": False,
+        "data_schema": {},
+    }
+    learned_prediction_run = {
+        **common_prediction_run,
+        "method": "learned",
+        "checkpoint_sha256": sha256_file(checkpoint_path),
+        "evaluation_binding": learned_binding,
+    }
+    persistence_prediction_run = {
+        **common_prediction_run,
+        "method": "persistence",
+        "checkpoint_sha256": "",
+        "evaluation_binding": persistence_binding,
+    }
+    return selection_path, audit_path, learned_prediction_run, persistence_prediction_run
+
+
 def make_tree(root: Path) -> tuple[Path, Path, Path, list[Path], Path]:
     oracle_dir = root / "oracle"
     learned_dir = root / "learned"
@@ -90,6 +353,7 @@ def make_tree(root: Path) -> tuple[Path, Path, Path, list[Path], Path]:
     oracle_dir.mkdir()
     rows = []
     learned_paths = []
+    examples = []
     for index in range(4):
         clip_id = f"clip-{index}"
         t0_us = 1000 + index
@@ -100,23 +364,14 @@ def make_tree(root: Path) -> tuple[Path, Path, Path, list[Path], Path]:
             target = np.asarray(archive["occupancy"], dtype=np.float32)
         learned_probability = np.where(target > 0, 0.9, 0.1).astype(np.float32)
         persistence_probability = np.zeros_like(target)
-        learned_paths.append(
-            write_prediction(
-                learned_dir,
+        examples.append(
+            (
                 oracle_path,
                 clip_id,
                 t0_us,
-                method="learned",
-                probability=learned_probability,
+                learned_probability,
+                persistence_probability,
             )
-        )
-        write_prediction(
-            persistence_dir,
-            oracle_path,
-            clip_id,
-            t0_us,
-            method="persistence",
-            probability=persistence_probability,
         )
         rows.append(
             {
@@ -141,6 +396,7 @@ def make_tree(root: Path) -> tuple[Path, Path, Path, list[Path], Path]:
         }
         for row in rows
     ]
+    dataset_fingerprint = canonical_fingerprint(dataset_index)
     protocol_payload = {
         "schema_version": 1,
         "status": "frozen_before_test_evaluation",
@@ -153,11 +409,22 @@ def make_tree(root: Path) -> tuple[Path, Path, Path, list[Path], Path]:
                     "sha256": sha256_file(manifest),
                     "clips": len(rows),
                     "chunks": len({row["chunk_id"] for row in rows}),
-                    "dataset_fingerprint": canonical_fingerprint(dataset_index),
+                    "dataset_fingerprint": dataset_fingerprint,
                 }
             },
         },
-        "training": {},
+        "training": {
+            "seeds": [2026, 2027],
+            "epochs": 1,
+            "batch_size": 1,
+            "workers": 0,
+            "base_channels": 2,
+            "automatic_mixed_precision": False,
+            "learning_rate": 0.001,
+            "weight_decay": 0.0,
+            "checkpoint_selection": "minimum_best_validation_loss",
+            "test_metrics_used_for_selection": False,
+        },
         "forecast_evaluation": {
             "metrics": ["average_precision", "brier", "iou"],
             "short_horizons_s": HORIZONS.tolist(),
@@ -186,6 +453,35 @@ def make_tree(root: Path) -> tuple[Path, Path, Path, list[Path], Path]:
     protocol_payload["protocol_fingerprint"] = canonical_fingerprint(protocol_payload)
     protocol = root / "protocol.json"
     protocol.write_text(json.dumps(protocol_payload, sort_keys=True) + "\n", encoding="utf-8")
+    _, _, learned_run, persistence_run = write_binding_records(
+        root,
+        protocol,
+        manifest,
+        clips=len(rows),
+        chunks=len({row["chunk_id"] for row in rows}),
+        dataset_fingerprint=dataset_fingerprint,
+    )
+    for oracle_path, clip_id, t0_us, learned_probability, persistence_probability in examples:
+        learned_paths.append(
+            write_prediction(
+                learned_dir,
+                oracle_path,
+                clip_id,
+                t0_us,
+                method="learned",
+                probability=learned_probability,
+                prediction_run=learned_run,
+            )
+        )
+        write_prediction(
+            persistence_dir,
+            oracle_path,
+            clip_id,
+            t0_us,
+            method="persistence",
+            probability=persistence_probability,
+            prediction_run=persistence_run,
+        )
     return manifest, learned_dir, persistence_dir, learned_paths, protocol
 
 
@@ -201,6 +497,8 @@ def compare_fixture(
         "manifest": manifest,
         "learned_prediction_dir": learned,
         "persistence_prediction_dir": persistence,
+        "selection_record": protocol.parent / "checkpoint_selection.json",
+        "evaluation_audit": protocol.parent / "evaluation_partition.json",
         "ap_bins": TEST_AP_BINS,
         "bootstrap_replicates": TEST_BOOTSTRAP_REPLICATES,
         "bootstrap_seed": TEST_BOOTSTRAP_SEED,
@@ -218,6 +516,8 @@ class ForecastComparisonTest(unittest.TestCase):
                 "manifest": manifest,
                 "learned_prediction_dir": learned,
                 "persistence_prediction_dir": persistence,
+                "selection_record": protocol.parent / "checkpoint_selection.json",
+                "evaluation_audit": protocol.parent / "evaluation_partition.json",
                 "ap_bins": TEST_AP_BINS,
                 "bootstrap_replicates": TEST_BOOTSTRAP_REPLICATES,
                 "bootstrap_seed": TEST_BOOTSTRAP_SEED,
@@ -231,7 +531,11 @@ class ForecastComparisonTest(unittest.TestCase):
             self.assertEqual(len(result["inputs"]["manifest"]["manifest_sha256"]), 64)
             self.assertEqual(
                 result["inputs"]["predictions"]["learned"]["checkpoint_sha256"],
-                CHECKPOINT,
+                json.loads(
+                    (protocol.parent / "checkpoint_selection.json").read_text(
+                        encoding="utf-8"
+                    )
+                )["selected_checkpoint_sha256"],
             )
             self.assertFalse(
                 result["configuration"]["average_precision"]["trapezoidal_pr_auc"]
@@ -252,6 +556,20 @@ class ForecastComparisonTest(unittest.TestCase):
             self.assertAlmostEqual(difference["positive_prevalence"]["estimate"], 0.0)
             self.assertTrue(result["acceptance_gates"]["all_passed"])
             self.assertEqual(result["protocol"]["sha256"], sha256_file(protocol))
+            self.assertEqual(
+                result["inputs"]["predictions"]["learned"]["authenticated_run"][
+                    "partition_isolation"
+                ],
+                {
+                    "train_evaluation_chunk_overlap": 0,
+                    "validation_evaluation_chunk_overlap": 0,
+                },
+            )
+            self.assertIsNone(
+                result["inputs"]["predictions"]["persistence"]["authenticated_run"][
+                    "checkpoint_selection"
+                ]
+            )
             self.assertFalse(
                 result["configuration"]["uncertainty_scope"][
                     "training_seed_variability_included"
@@ -276,6 +594,10 @@ class ForecastComparisonTest(unittest.TestCase):
                     str(learned),
                     "--persistence-prediction-dir",
                     str(persistence),
+                    "--selection-record",
+                    str(root / "checkpoint_selection.json"),
+                    "--evaluation-audit",
+                    str(root / "evaluation_partition.json"),
                     "--output",
                     str(output),
                     "--bootstrap-replicates",
@@ -362,7 +684,7 @@ class ForecastComparisonTest(unittest.TestCase):
     def test_rejects_mixed_learned_run_or_checkpoint(self) -> None:
         for field, replacement, message in (
             ("prediction_run_fingerprint", np.asarray("d" * 64), "run fingerprint"),
-            ("checkpoint_sha256", np.asarray("e" * 64), "checkpoint identity"),
+            ("checkpoint_sha256", np.asarray("e" * 64), "checkpoint"),
         ):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
                 manifest, learned, persistence, learned_paths, protocol = make_tree(
@@ -370,6 +692,84 @@ class ForecastComparisonTest(unittest.TestCase):
                 )
                 replace_array(learned_paths[0], field, replacement)
                 with self.assertRaisesRegex(ValueError, message):
+                    compare_fixture(manifest, learned, persistence, protocol)
+
+    def test_rejects_missing_or_forged_prediction_run_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, learned, persistence, learned_paths, protocol = make_tree(
+                Path(temporary)
+            )
+            remove_array(learned_paths[0], "prediction_run_json")
+            with self.assertRaisesRegex(ValueError, "prediction_run_json"):
+                compare_fixture(manifest, learned, persistence, protocol)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, learned, persistence, learned_paths, protocol = make_tree(
+                Path(temporary)
+            )
+            path = learned_paths[0]
+            with np.load(path, allow_pickle=False) as archive:
+                arrays = {key: archive[key] for key in archive.files}
+            forged = json.loads(str(arrays["prediction_run_json"]))
+            forged["amp"] = True
+            arrays["prediction_run_json"] = np.asarray(
+                json.dumps(forged, sort_keys=True, separators=(",", ":"))
+            )
+            np.savez_compressed(path, **arrays)
+            with self.assertRaisesRegex(ValueError, "fingerprint does not match"):
+                compare_fixture(manifest, learned, persistence, protocol)
+
+    def test_rejects_noncanonical_or_mixed_prediction_run_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, learned, persistence, learned_paths, protocol = make_tree(
+                Path(temporary)
+            )
+            path = learned_paths[0]
+            with np.load(path, allow_pickle=False) as archive:
+                arrays = {key: archive[key] for key in archive.files}
+            run = json.loads(str(arrays["prediction_run_json"]))
+            arrays["prediction_run_json"] = np.asarray(json.dumps(run, sort_keys=True))
+            np.savez_compressed(path, **arrays)
+            with self.assertRaisesRegex(ValueError, "not canonically encoded"):
+                compare_fixture(manifest, learned, persistence, protocol)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, learned, persistence, learned_paths, protocol = make_tree(
+                Path(temporary)
+            )
+            replace_prediction_run(learned_paths[0], lambda run: run.update(amp=True))
+            with self.assertRaisesRegex(ValueError, "one canonical run payload"):
+                compare_fixture(manifest, learned, persistence, protocol)
+
+    def test_rejects_wrong_checkpoint_audit_or_protocol_in_run(self) -> None:
+        mutations = (
+            (
+                lambda run: run["evaluation_binding"]["checkpoint"].update(
+                    sha256="5" * 64
+                ),
+                "checkpoint",
+            ),
+            (
+                lambda run: run["evaluation_binding"]["evaluation_audit"].update(
+                    sha256="6" * 64
+                ),
+                "audit",
+            ),
+            (
+                lambda run: run["evaluation_binding"]["protocol"].update(
+                    sha256="7" * 64
+                ),
+                "protocol",
+            ),
+        )
+        for mutate, label in mutations:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                manifest, learned, persistence, learned_paths, protocol = make_tree(
+                    Path(temporary)
+                )
+                for path in learned_paths:
+                    replace_prediction_run(path, mutate)
+                with self.assertRaisesRegex(ValueError, "evaluation binding"):
                     compare_fixture(manifest, learned, persistence, protocol)
 
     def test_rejects_source_method_geometry_and_nonfinite_probability(self) -> None:
