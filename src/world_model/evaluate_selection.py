@@ -32,10 +32,12 @@ from .protocol import (
     validate_source_manifest_binding,
     validate_uncertainty_configuration,
 )
+from .rerank import RerankWeights, rerank_artifacts
 from .runtime import canonical_fingerprint, sha256_file, write_json
 
 
 OUTPUT_SCHEMA_VERSION = 1
+FORECAST_COMPARISON_SCHEMA_VERSION = 1
 ORACLE_SCHEMA_VERSION = 4
 HEX_DIGITS = frozenset("0123456789abcdef")
 POLICIES = (
@@ -85,6 +87,27 @@ RISK_ARRAYS = {
 }
 
 
+def _protocol_rerank_weights(protocol: FrozenProtocol) -> RerankWeights:
+    """Load the exact reranker weights declared by the frozen protocol."""
+
+    selection = protocol.payload["trajectory_selection"]
+    if not isinstance(selection, dict):
+        raise ValueError("Frozen protocol trajectory_selection must be an object")
+    values = selection.get("reranker_weights")
+    if not isinstance(values, dict):
+        raise ValueError("Frozen protocol reranker_weights must be an object")
+    names = set(RerankWeights.__dataclass_fields__)
+    if set(values) != names:
+        raise ValueError(
+            "Frozen protocol reranker_weights fields are not supported exactly"
+        )
+    normalized = {
+        name: _finite_nonnegative(values[name], f"protocol reranker weight {name}")
+        for name in sorted(names)
+    }
+    return RerankWeights(**normalized)
+
+
 def _identity(row: Mapping[str, Any], source: str) -> tuple[str, int]:
     try:
         clip_id = str(row["clip_id"])
@@ -119,6 +142,14 @@ def _finite(value: Any, name: str) -> float:
     if not math.isfinite(number):
         raise ValueError(f"{name} must be finite")
     return number
+
+
+def _is_finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
 
 
 def _index_rows(
@@ -158,6 +189,181 @@ def _load_jsonl(path: str | Path, source: str) -> list[dict[str, Any]]:
     return rows
 
 
+def _load_forecast_comparison(
+    path: str | Path,
+    *,
+    protocol: FrozenProtocol,
+    test_manifest: Path,
+    test_rows: Sequence[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Validate the forecast report bound to this protocol and test split."""
+
+    report_path = Path(path).expanduser().resolve()
+    try:
+        report_bytes = report_path.read_bytes()
+        report = json.loads(report_bytes)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Invalid forecast comparison: {report_path}") from error
+    if not isinstance(report, dict):
+        raise ValueError("Forecast comparison must be a JSON object")
+    if report.get("schema_version") != FORECAST_COMPARISON_SCHEMA_VERSION:
+        raise ValueError("Forecast comparison has an unsupported schema version")
+    if report.get("comparison") != "learned_minus_persistence":
+        raise ValueError("Forecast comparison has an unsupported comparison")
+
+    report_protocol = report.get("protocol")
+    if not isinstance(report_protocol, dict):
+        raise ValueError("Forecast comparison has no protocol provenance")
+    try:
+        report_protocol_path = Path(str(report_protocol["path"])).expanduser().resolve()
+    except KeyError as error:
+        raise ValueError(
+            "Forecast comparison protocol provenance is incomplete"
+        ) from error
+    expected_protocol = protocol.provenance()
+    if report_protocol_path != protocol.path:
+        raise ValueError("Forecast comparison uses a different protocol path")
+    for name in ("sha256", "protocol_fingerprint"):
+        if report_protocol.get(name) != expected_protocol[name]:
+            raise ValueError(f"Forecast comparison protocol {name} does not match")
+
+    inputs = report.get("inputs")
+    manifest = inputs.get("manifest") if isinstance(inputs, dict) else None
+    if not isinstance(manifest, dict):
+        raise ValueError("Forecast comparison has no test-manifest provenance")
+    actual_manifest_sha256 = sha256_file(test_manifest)
+    actual_dataset_fingerprint = canonical_fingerprint(
+        [
+            {
+                "artifact_sha256": row["artifact_sha256"],
+                "chunk_id": str(row["chunk_id"]),
+                "clip_id": str(row["clip_id"]),
+                "t0_us": int(row["t0_us"]),
+            }
+            for row in test_rows
+        ]
+    )
+    try:
+        report_manifest_path = (
+            Path(str(manifest["manifest_path"])).expanduser().resolve()
+        )
+    except KeyError as error:
+        raise ValueError(
+            "Forecast comparison test-manifest provenance is incomplete"
+        ) from error
+    expected_manifest_values = {
+        "manifest_sha256": actual_manifest_sha256,
+        "dataset_fingerprint": actual_dataset_fingerprint,
+        "clips": len(test_rows),
+        "chunks": len({str(row["chunk_id"]) for row in test_rows}),
+    }
+    if report_manifest_path != test_manifest:
+        raise ValueError("Forecast comparison uses a different test-manifest path")
+    for name, expected in expected_manifest_values.items():
+        if manifest.get(name) != expected:
+            raise ValueError(f"Forecast comparison test-manifest {name} does not match")
+
+    gates = report.get("acceptance_gates")
+    rules = protocol.payload["acceptance_gates"].get("forecast")
+    if not isinstance(gates, dict) or not isinstance(rules, dict):
+        raise ValueError("Forecast comparison acceptance gates are incomplete")
+    require_exact_mapping(
+        rules,
+        {
+            "average_precision": "learned_higher_than_persistence",
+            "brier": "learned_lower_than_persistence",
+            "iou": "learned_higher_than_persistence",
+        },
+        "acceptance_gates.forecast",
+    )
+    decisions = gates.get("decisions")
+    if not isinstance(decisions, dict) or set(decisions) != set(rules):
+        raise ValueError("Forecast comparison gate decisions do not match the protocol")
+    metrics = report.get("metrics")
+    paired = report.get("paired_differences")
+    try:
+        learned = metrics["learned"]["short_horizon"]
+        persistence = metrics["persistence"]["short_horizon"]
+        paired_short = paired["short_horizon"]
+    except (KeyError, TypeError) as error:
+        raise ValueError(
+            "Forecast comparison metric summaries are incomplete"
+        ) from error
+    passed_values: list[bool] = []
+    for metric, rule in rules.items():
+        decision = decisions[metric]
+        if not isinstance(decision, dict) or decision.get("rule") != rule:
+            raise ValueError(f"Forecast comparison {metric} gate rule does not match")
+        try:
+            learned_value = learned[metric]
+            persistence_value = persistence[metric]
+            difference = paired_short[metric]["estimate"]
+        except (KeyError, TypeError) as error:
+            raise ValueError(
+                f"Forecast comparison {metric} values are incomplete"
+            ) from error
+        expected_values = {
+            "learned": learned_value,
+            "persistence": persistence_value,
+            "learned_minus_persistence": difference,
+        }
+        if any(decision.get(name) != value for name, value in expected_values.items()):
+            raise ValueError(f"Forecast comparison {metric} gate values do not match")
+        values = (learned_value, persistence_value, difference)
+        if any(value is not None and not _is_finite_number(value) for value in values):
+            raise ValueError(f"Forecast comparison {metric} gate values are invalid")
+        defined = all(value is not None for value in values)
+        if rule == "learned_higher_than_persistence":
+            expected_passed = defined and float(difference) > 0.0
+        elif rule == "learned_lower_than_persistence":
+            expected_passed = defined and float(difference) < 0.0
+        else:
+            raise ValueError(f"Unsupported forecast comparison gate rule: {rule}")
+        if decision.get("passed") is not expected_passed:
+            raise ValueError(
+                f"Forecast comparison {metric} gate decision is inconsistent"
+            )
+        passed_values.append(expected_passed)
+    expected_all_passed = all(passed_values)
+    if gates.get("all_passed") is not expected_all_passed:
+        raise ValueError("Forecast comparison aggregate gate decision is inconsistent")
+
+    return report, {
+        "path": str(report_path),
+        "sha256": hashlib.sha256(report_bytes).hexdigest(),
+    }
+
+
+def _evaluation_manifest_binding(
+    manifest_path: Path, rows: Sequence[dict[str, Any]]
+) -> dict[str, Any]:
+    """Recompute the evaluation provenance encoded by prediction producers."""
+
+    entries = [
+        {
+            "artifact_sha256": sha256_file(row["artifact_path"]),
+            "chunk_id": str(row["chunk_id"]),
+            "clip_id": str(row["clip_id"]),
+            "t0_us": int(row["t0_us"]),
+        }
+        for row in sorted(
+            rows,
+            key=lambda item: (
+                str(item["chunk_id"]),
+                str(item["clip_id"]),
+                int(item["t0_us"]),
+            ),
+        )
+    ]
+    return {
+        "path": str(manifest_path),
+        "sha256": sha256_file(manifest_path),
+        "dataset_fingerprint": canonical_fingerprint(entries),
+        "clips": len(entries),
+        "chunks": len({entry["chunk_id"] for entry in entries}),
+    }
+
+
 def _resolve_row_path(row: Mapping[str, Any], key: str, parent: Path) -> Path:
     try:
         path = Path(str(row[key])).expanduser()
@@ -166,6 +372,310 @@ def _resolve_row_path(row: Mapping[str, Any], key: str, parent: Path) -> Path:
     if not path.is_absolute():
         path = parent / path
     return path.resolve()
+
+
+def _read_bound_json(
+    path_value: Any, expected_sha256: Any, label: str
+) -> dict[str, Any]:
+    """Read one referenced JSON record and require its exact recorded bytes."""
+
+    path = Path(str(path_value)).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"Prediction {label} does not exist: {path}")
+    if not _valid_sha256(expected_sha256) or sha256_file(path) != expected_sha256:
+        raise ValueError(f"Prediction {label} SHA-256 does not match")
+    try:
+        payload = json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Prediction {label} is not valid JSON: {path}") from error
+    if not isinstance(payload, dict):
+        raise ValueError(f"Prediction {label} must be a JSON object")
+    return payload
+
+
+def _validate_prediction_run(
+    prediction_path: Path,
+    *,
+    expected_method: str,
+    expected_checkpoint_sha256: Any,
+    protocol: FrozenProtocol,
+    evaluation_manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Authenticate embedded run metadata and its held-out evaluation binding."""
+
+    with np.load(prediction_path, allow_pickle=False) as archive:
+        for name in ("prediction_run_json", "prediction_run_fingerprint"):
+            if name not in archive.files:
+                raise ValueError(
+                    f"Prediction artifact is missing {name}: {prediction_path}"
+                )
+            if np.asarray(archive[name]).shape != ():
+                raise ValueError(
+                    f"Prediction artifact {name} must be scalar: {prediction_path}"
+                )
+        run_json = str(np.asarray(archive["prediction_run_json"]).reshape(()))
+        embedded_fingerprint = str(
+            np.asarray(archive["prediction_run_fingerprint"]).reshape(())
+        )
+        try:
+            run = json.loads(run_json)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"Prediction run metadata is not valid JSON: {prediction_path}"
+            ) from error
+        if not isinstance(run, dict):
+            raise ValueError("Prediction run metadata must be a JSON object")
+        try:
+            canonical_json = json.dumps(
+                run, sort_keys=True, separators=(",", ":"), allow_nan=False
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "Prediction run metadata is not canonical JSON data"
+            ) from error
+        if run_json != canonical_json:
+            raise ValueError("Prediction run JSON is not canonically encoded")
+        if (
+            not _valid_sha256(embedded_fingerprint)
+            or canonical_fingerprint(run) != embedded_fingerprint
+        ):
+            raise ValueError("Prediction run fingerprint does not match its metadata")
+
+        required_run_fields = {
+            "method",
+            "data_role",
+            "checkpoint_sha256",
+            "amp",
+            "evaluation_binding",
+            "data_schema",
+        }
+        if set(run) != required_run_fields:
+            raise ValueError("Prediction run metadata fields are not supported exactly")
+        if run["method"] != expected_method:
+            raise ValueError("Prediction run method does not match the reranker input")
+        if run["data_role"] != "test":
+            raise ValueError("Prediction run is not bound to the held-out test role")
+        expected_checkpoint = (
+            ""
+            if expected_checkpoint_sha256 in (None, "")
+            else str(expected_checkpoint_sha256)
+        )
+        if run["checkpoint_sha256"] != expected_checkpoint:
+            raise ValueError("Prediction run checkpoint does not match the artifact")
+        if not isinstance(run["amp"], bool):
+            raise ValueError("Prediction run amp field must be boolean")
+
+        data_schema = run["data_schema"]
+        schema_fields = {
+            "input_shape",
+            "target_shape",
+            "past_horizons_s",
+            "horizons_s",
+            "grid_origin_xy_m",
+            "resolution_m",
+            "coordinate_frame",
+        }
+        if not isinstance(data_schema, dict) or set(data_schema) != schema_fields:
+            raise ValueError(
+                "Prediction run data schema fields are not supported exactly"
+            )
+        probability_shape = list(np.asarray(archive["occupancy_prob"]).shape)
+        if data_schema["target_shape"] != probability_shape:
+            raise ValueError("Prediction run target shape does not match the artifact")
+        embedded_schema = {
+            "horizons_s": np.asarray(archive["horizons_s"], dtype=np.float64),
+            "grid_origin_xy_m": np.asarray(
+                archive["grid_origin_xy_m"], dtype=np.float64
+            ),
+        }
+        for name, embedded in embedded_schema.items():
+            declared = np.asarray(data_schema[name], dtype=np.float64)
+            if declared.shape != embedded.shape or not np.array_equal(
+                declared, embedded
+            ):
+                raise ValueError(f"Prediction run {name} does not match the artifact")
+        if float(data_schema["resolution_m"]) != float(
+            np.asarray(archive["resolution_m"]).reshape(())
+        ):
+            raise ValueError("Prediction run resolution does not match the artifact")
+        if str(data_schema["coordinate_frame"]) != str(
+            np.asarray(archive["coordinate_frame"]).reshape(())
+        ):
+            raise ValueError(
+                "Prediction run coordinate frame does not match the artifact"
+            )
+        for name in ("input_shape", "past_horizons_s"):
+            values = data_schema[name]
+            if not isinstance(values, list) or not values:
+                raise ValueError(f"Prediction run {name} must be a non-empty list")
+
+    binding = run["evaluation_binding"]
+    common_binding_fields = {
+        "evaluation_manifest",
+        "checkpoint",
+        "checkpoint_selection",
+        "evaluation_audit",
+        "partition_isolation",
+        "binding_fingerprint",
+    }
+    if not isinstance(binding, dict) or set(binding) not in (
+        common_binding_fields,
+        common_binding_fields | {"protocol"},
+    ):
+        raise ValueError(
+            "Prediction evaluation-binding fields are not supported exactly"
+        )
+    binding_payload = dict(binding)
+    binding_fingerprint = binding_payload.pop("binding_fingerprint")
+    if (
+        not _valid_sha256(binding_fingerprint)
+        or canonical_fingerprint(binding_payload) != binding_fingerprint
+    ):
+        raise ValueError("Prediction evaluation-binding fingerprint does not match")
+    if canonical_fingerprint(
+        binding.get("evaluation_manifest")
+    ) != canonical_fingerprint(dict(evaluation_manifest)):
+        raise ValueError("Prediction run uses a different test-manifest binding")
+
+    protocol_record = binding.get("protocol")
+    if protocol_record is not None and canonical_fingerprint(
+        protocol_record
+    ) != canonical_fingerprint(protocol.provenance()):
+        raise ValueError("Prediction run protocol provenance does not match")
+
+    checkpoint = binding.get("checkpoint")
+    selection = binding.get("checkpoint_selection")
+    audit = binding.get("evaluation_audit")
+    isolation = binding.get("partition_isolation")
+    if not isinstance(isolation, dict) or set(isolation) != {
+        "train_evaluation_chunk_overlap",
+        "validation_evaluation_chunk_overlap",
+    }:
+        raise ValueError("Prediction partition-isolation record is incomplete")
+    if expected_method == "learned":
+        checkpoint_fields = {
+            "path",
+            "sha256",
+            "epoch",
+            "seed",
+            "train_manifest_sha256",
+            "validation_manifest_sha256",
+            "train_dataset_fingerprint",
+            "validation_dataset_fingerprint",
+        }
+        if not isinstance(checkpoint, dict) or set(checkpoint) != checkpoint_fields:
+            raise ValueError("Learned prediction checkpoint binding is incomplete")
+        if checkpoint.get("sha256") != expected_checkpoint:
+            raise ValueError("Learned prediction checkpoint binding does not match")
+        for name in checkpoint_fields - {"path", "epoch", "seed"}:
+            if not _valid_sha256(checkpoint.get(name)):
+                raise ValueError(f"Learned prediction checkpoint {name} is invalid")
+        for name in ("epoch", "seed"):
+            if isinstance(checkpoint[name], bool) or not isinstance(
+                checkpoint[name], int
+            ):
+                raise ValueError(f"Learned prediction checkpoint {name} is invalid")
+        if not isinstance(selection, dict) or not isinstance(audit, dict):
+            raise ValueError(
+                "Learned prediction has no checkpoint-selection audit binding"
+            )
+        if isolation != {
+            "train_evaluation_chunk_overlap": 0,
+            "validation_evaluation_chunk_overlap": 0,
+        }:
+            raise ValueError(
+                "Learned prediction partition isolation is not demonstrated"
+            )
+
+        selection_record = _read_bound_json(
+            selection.get("path"), selection.get("sha256"), "checkpoint selection"
+        )
+        record_fingerprint = selection_record.get("selection_fingerprint")
+        record_payload = dict(selection_record)
+        record_payload.pop("selection_fingerprint", None)
+        if (
+            not _valid_sha256(record_fingerprint)
+            or canonical_fingerprint(record_payload) != record_fingerprint
+            or selection.get("selection_fingerprint") != record_fingerprint
+        ):
+            raise ValueError(
+                "Prediction checkpoint-selection fingerprint does not match"
+            )
+        if selection_record.get("selected_checkpoint_sha256") != expected_checkpoint:
+            raise ValueError(
+                "Prediction checkpoint selection chose a different checkpoint"
+            )
+        if (
+            Path(str(selection_record.get("selected_checkpoint")))
+            .expanduser()
+            .resolve()
+            != Path(str(checkpoint["path"])).expanduser().resolve()
+        ):
+            raise ValueError("Prediction checkpoint selection chose a different path")
+        if (
+            selection_record.get("selected_epoch") != checkpoint["epoch"]
+            or selection_record.get("selected_seed") != checkpoint["seed"]
+        ):
+            raise ValueError("Prediction checkpoint selection metadata does not match")
+        for name in (
+            "selected_label",
+            "selected_seed",
+            "selected_epoch",
+            "selected_validation_loss",
+        ):
+            if selection.get(name) != selection_record.get(name):
+                raise ValueError(
+                    f"Prediction checkpoint-selection {name} does not match its record"
+                )
+
+        audit_record = _read_bound_json(
+            audit.get("path"), audit.get("sha256"), "evaluation audit"
+        )
+        if audit.get("record_fingerprint") != canonical_fingerprint(audit_record):
+            raise ValueError("Prediction evaluation-audit fingerprint does not match")
+        if (
+            audit.get("selection_fingerprint") != record_fingerprint
+            or audit_record.get("selection_fingerprint") != record_fingerprint
+        ):
+            raise ValueError("Prediction evaluation audit binds a different selection")
+        audit_expectations = {
+            "selection": str(Path(str(selection["path"])).expanduser().resolve()),
+            "selection_sha256": selection["sha256"],
+            "test_manifest": evaluation_manifest["path"],
+            "test_manifest_sha256": evaluation_manifest["sha256"],
+            "test_clips": evaluation_manifest["clips"],
+            "test_chunks": evaluation_manifest["chunks"],
+            "checkpoint_sha256": expected_checkpoint,
+            "train_test_chunk_overlap": 0,
+            "validation_test_chunk_overlap": 0,
+        }
+        for name, expected in audit_expectations.items():
+            actual = audit_record.get(name)
+            if name in {"selection", "test_manifest"}:
+                actual = str(Path(str(actual)).expanduser().resolve())
+            if actual != expected:
+                raise ValueError(f"Prediction evaluation audit {name} does not match")
+        if (
+            Path(str(audit_record.get("checkpoint"))).expanduser().resolve()
+            != Path(str(checkpoint["path"])).expanduser().resolve()
+        ):
+            raise ValueError(
+                "Prediction evaluation audit checkpoint path does not match"
+            )
+        for name in ("train_test_chunk_overlap", "validation_test_chunk_overlap"):
+            if audit.get(name) != 0:
+                raise ValueError(f"Prediction evaluation-audit {name} is not zero")
+    else:
+        if checkpoint is not None or selection is not None or audit is not None:
+            raise ValueError(
+                "Persistence prediction must not carry checkpoint selection metadata"
+            )
+        if isolation != {
+            "train_evaluation_chunk_overlap": None,
+            "validation_evaluation_chunk_overlap": None,
+        }:
+            raise ValueError("Persistence prediction has invalid partition metadata")
+    return run
 
 
 def _reject_split_leakage(
@@ -210,7 +720,9 @@ def cluster_bootstrap_interval(
     array = np.asarray(values, dtype=np.float64)
     clusters = np.asarray([str(value) for value in cluster_ids], dtype=np.str_)
     if array.ndim != 1 or clusters.shape != array.shape or array.size == 0:
-        raise ValueError("Bootstrap values and cluster_ids must be non-empty 1-D arrays")
+        raise ValueError(
+            "Bootstrap values and cluster_ids must be non-empty 1-D arrays"
+        )
     if not np.isfinite(array).all():
         raise ValueError("Bootstrap values must be finite")
     if replicates < 1:
@@ -283,7 +795,9 @@ def _load_candidate_records(
         record = index[identity]
         record_path = Path(str(record["record_path"]))
         if sha256_file(record_path) != record["record_sha256"]:
-            raise ValueError(f"Candidate record changed while evaluating: {record_path}")
+            raise ValueError(
+                f"Candidate record changed while evaluating: {record_path}"
+            )
         artifact_value = Path(str(record.get("artifact_path", "")))
         if not str(artifact_value) or artifact_value.is_absolute():
             raise ValueError(
@@ -291,12 +805,16 @@ def _load_candidate_records(
             )
         artifact_path = (root / artifact_value).resolve()
         if not artifact_path.is_relative_to(root):
-            raise ValueError(f"Candidate record {record_path} escapes the candidate root")
+            raise ValueError(
+                f"Candidate record {record_path} escapes the candidate root"
+            )
         if not artifact_path.is_file():
             raise FileNotFoundError(f"Candidate artifact not found: {artifact_path}")
         artifact_sha256 = str(record.get("artifact_sha256", ""))
         if not _valid_sha256(artifact_sha256):
-            raise ValueError(f"Candidate record {record_path} has an invalid artifact SHA-256")
+            raise ValueError(
+                f"Candidate record {record_path} has an invalid artifact SHA-256"
+            )
         if sha256_file(artifact_path) != artifact_sha256:
             raise ValueError(f"Candidate artifact SHA-256 mismatch: {artifact_path}")
         config_fingerprint = str(record.get("config_fingerprint", ""))
@@ -330,9 +848,13 @@ def _load_candidate_records(
                 int(np.asarray(artifact["t0_us"]).reshape(())),
             )
             if embedded_identity != identity:
-                raise ValueError(f"Candidate artifact identity mismatch: {artifact_path}")
+                raise ValueError(
+                    f"Candidate artifact identity mismatch: {artifact_path}"
+                )
             if int(np.asarray(artifact["schema_version"]).reshape(())) != 1:
-                raise ValueError(f"Unsupported candidate artifact schema: {artifact_path}")
+                raise ValueError(
+                    f"Unsupported candidate artifact schema: {artifact_path}"
+                )
             embedded_fingerprint = str(
                 np.asarray(artifact["config_fingerprint"]).reshape(())
             )
@@ -350,7 +872,9 @@ def _load_candidate_records(
             or not np.isfinite(pred_xyz).all()
             or not np.isfinite(gt_xyz).all()
         ):
-            raise ValueError(f"Candidate trajectory geometry is invalid: {artifact_path}")
+            raise ValueError(
+                f"Candidate trajectory geometry is invalid: {artifact_path}"
+            )
 
         displacement = np.linalg.norm(pred_xyz[:, :, :2] - gt_xyz[None, :, :2], axis=2)
         metrics: list[dict[str, float]] = []
@@ -502,16 +1026,25 @@ def _validate_rerank_row(
     oracle_sha256: str,
     candidate_count: int,
     expected_producer_method: str,
+    expected_weights: RerankWeights,
+    protocol: FrozenProtocol,
+    evaluation_manifest: Mapping[str, Any],
 ) -> dict[str, Any]:
     if _identity(row, "rerank output") != identity:
         raise AssertionError("Rerank index returned the wrong identity")
     if int(row.get("candidate_count", -1)) != candidate_count:
-        raise ValueError(f"Rerank candidate count mismatch for {identity[0]}@{identity[1]}")
+        raise ValueError(
+            f"Rerank candidate count mismatch for {identity[0]}@{identity[1]}"
+        )
     if int(row.get("first_candidate_index", -1)) != 0:
-        raise ValueError(f"Rerank baseline index must be zero for {identity[0]}@{identity[1]}")
+        raise ValueError(
+            f"Rerank baseline index must be zero for {identity[0]}@{identity[1]}"
+        )
     selected_index = int(row.get("world_selected_index", -1))
     if not 0 <= selected_index < candidate_count:
-        raise ValueError(f"Rerank selected index is invalid for {identity[0]}@{identity[1]}")
+        raise ValueError(
+            f"Rerank selected index is invalid for {identity[0]}@{identity[1]}"
+        )
     producer_method = str(row.get("producer_method", ""))
     if producer_method != expected_producer_method:
         raise ValueError(
@@ -520,94 +1053,125 @@ def _validate_rerank_row(
         )
     checkpoint_sha256 = row.get("checkpoint_sha256")
     if expected_producer_method == "learned" and not _valid_sha256(checkpoint_sha256):
-        raise ValueError(f"Learned rerank has no valid checkpoint for {identity[0]}@{identity[1]}")
+        raise ValueError(
+            f"Learned rerank has no valid checkpoint for {identity[0]}@{identity[1]}"
+        )
     run_fingerprint = str(row.get("prediction_run_fingerprint", ""))
     if not _valid_sha256(run_fingerprint):
-        raise ValueError(f"Rerank run fingerprint is invalid for {identity[0]}@{identity[1]}")
+        raise ValueError(
+            f"Rerank run fingerprint is invalid for {identity[0]}@{identity[1]}"
+        )
     candidate_sha256 = str(row.get("candidate_sha256", ""))
     if candidate_sha256 != oracle_sha256:
-        raise ValueError(f"Rerank oracle artifact SHA-256 mismatch for {identity[0]}@{identity[1]}")
+        raise ValueError(
+            f"Rerank oracle artifact SHA-256 mismatch for {identity[0]}@{identity[1]}"
+        )
     candidate_path = _resolve_row_path(row, "candidate_path", rerank_parent)
     candidate_content_sha256 = (
         oracle_sha256
         if candidate_path == oracle_path
-        else sha256_file(candidate_path) if candidate_path.is_file() else ""
+        else sha256_file(candidate_path)
+        if candidate_path.is_file()
+        else ""
     )
     if candidate_content_sha256 != oracle_sha256:
-        raise ValueError(f"Rerank candidate_path content mismatch for {identity[0]}@{identity[1]}")
+        raise ValueError(
+            f"Rerank candidate_path content mismatch for {identity[0]}@{identity[1]}"
+        )
 
     prediction_sha256 = str(row.get("prediction_sha256", ""))
     if not _valid_sha256(prediction_sha256):
-        raise ValueError(f"Rerank prediction SHA-256 is invalid for {identity[0]}@{identity[1]}")
+        raise ValueError(
+            f"Rerank prediction SHA-256 is invalid for {identity[0]}@{identity[1]}"
+        )
     prediction_path = _resolve_row_path(row, "prediction_path", rerank_parent)
-    if not prediction_path.is_file() or sha256_file(prediction_path) != prediction_sha256:
-        raise ValueError(f"Rerank prediction content mismatch for {identity[0]}@{identity[1]}")
-    scores = row.get("candidate_scores")
-    if not isinstance(scores, list) or len(scores) != candidate_count:
-        raise ValueError(f"Rerank scores are invalid for {identity[0]}@{identity[1]}")
-    if expected_producer_method == "persistence" and checkpoint_sha256 not in (None, ""):
+    if (
+        not prediction_path.is_file()
+        or sha256_file(prediction_path) != prediction_sha256
+    ):
+        raise ValueError(
+            f"Rerank prediction content mismatch for {identity[0]}@{identity[1]}"
+        )
+    if expected_producer_method == "persistence" and checkpoint_sha256 not in (
+        None,
+        "",
+    ):
         raise ValueError(
             f"Persistence rerank claims a checkpoint for {identity[0]}@{identity[1]}"
         )
-    scalar_scores = np.asarray(
-        [_finite(score.get("score"), "rerank score") for score in scores],
-        dtype=np.float64,
+    recomputed = rerank_artifacts(
+        prediction_path,
+        candidate_path,
+        expected_weights,
+        expected_clip_id=identity[0],
+        expected_t0_us=identity[1],
     )
-    if selected_index != int(np.argmin(scalar_scores)):
+    prediction_run = _validate_prediction_run(
+        prediction_path,
+        expected_method=expected_producer_method,
+        expected_checkpoint_sha256=checkpoint_sha256,
+        protocol=protocol,
+        evaluation_manifest=evaluation_manifest,
+    )
+    if sha256_file(prediction_path) != prediction_sha256:
         raise ValueError(
-            f"Rerank selected index is not the score minimum for "
+            f"Rerank prediction changed during recomputation for "
             f"{identity[0]}@{identity[1]}"
         )
-    weights = row.get("weights")
-    if not isinstance(weights, dict) or not weights:
-        raise ValueError(f"Rerank weights are missing for {identity[0]}@{identity[1]}")
-    for name, value in weights.items():
-        _finite_nonnegative(value, f"rerank weight {name}")
-    missing_comfort_weights = sorted(
-        {weight_name for weight_name, _ in COMFORT_COMPONENTS.values()} - set(weights)
-    )
-    if missing_comfort_weights:
-        raise ValueError(
-            f"Rerank weights are missing comfort terms {missing_comfort_weights} for "
-            f"{identity[0]}@{identity[1]}"
-        )
-    comfort_components: list[dict[str, float]] = []
-    for candidate_index, score in enumerate(scores):
-        if not isinstance(score, dict):
+    for name in (
+        "candidate_count",
+        "first_candidate_index",
+        "world_selected_index",
+        "selection_policy",
+        "producer_method",
+        "checkpoint_sha256",
+        "prediction_run_fingerprint",
+        "candidate_sha256",
+    ):
+        if row.get(name) != recomputed[name]:
             raise ValueError(
-                f"Rerank candidate score {candidate_index} is invalid for "
+                f"Rerank {name} does not match recomputation for "
                 f"{identity[0]}@{identity[1]}"
             )
-        components = {
-            component: _finite(
-                score.get(component),
-                f"rerank candidate {candidate_index} {component}",
+    weights = row.get("weights")
+    require_exact_mapping(weights, recomputed["weights"], "reranker weights")
+    scores = row.get("candidate_scores")
+    expected_scores = recomputed["candidate_scores"]
+    if not isinstance(scores, list) or len(scores) != len(expected_scores):
+        raise ValueError(f"Rerank scores are invalid for {identity[0]}@{identity[1]}")
+    comfort_components: list[dict[str, float]] = []
+    for candidate_index, (score, expected_score) in enumerate(
+        zip(scores, expected_scores, strict=True)
+    ):
+        if not isinstance(score, dict) or set(score) != set(expected_score):
+            raise ValueError(
+                f"Rerank candidate score fields differ from recomputation for "
+                f"{identity[0]}@{identity[1]}"
             )
+        for name, expected in expected_score.items():
+            actual = _finite(
+                score.get(name), f"rerank candidate {candidate_index} {name}"
+            )
+            if not np.isclose(actual, expected, rtol=1e-7, atol=1e-9):
+                raise ValueError(
+                    f"Rerank candidate {candidate_index} {name} differs from "
+                    f"recomputation for {identity[0]}@{identity[1]}"
+                )
+        components = {
+            component: float(expected_score[component])
             for component in COMFORT_COMPONENTS
         }
-        for component in (
-            "mean_acceleration_mps2",
-            "mean_jerk_mps3",
-            "max_curvature_inv_m",
-        ):
-            if components[component] < 0:
-                raise ValueError(
-                    f"Rerank candidate {candidate_index} {component} must be "
-                    f"non-negative for {identity[0]}@{identity[1]}"
-                )
         comfort_components.append(components)
-    selection_policy = str(row.get("selection_policy", ""))
-    if not selection_policy:
-        raise ValueError(f"Rerank selection policy is empty for {identity[0]}@{identity[1]}")
     return {
-        "selected_index": selected_index,
-        "producer_method": producer_method,
-        "checkpoint_sha256": str(checkpoint_sha256) if checkpoint_sha256 else None,
-        "prediction_run_fingerprint": run_fingerprint,
-        "selection_policy": selection_policy,
-        "weights": weights,
+        "selected_index": recomputed["world_selected_index"],
+        "producer_method": recomputed["producer_method"],
+        "checkpoint_sha256": recomputed["checkpoint_sha256"],
+        "prediction_run_fingerprint": recomputed["prediction_run_fingerprint"],
+        "selection_policy": recomputed["selection_policy"],
+        "weights": recomputed["weights"],
         "comfort_components": comfort_components,
         "prediction_sha256": prediction_sha256,
+        "prediction_run": prediction_run,
     }
 
 
@@ -677,7 +1241,9 @@ def _candidate_diversity(
         or trajectories.shape[2] < 2
         or not np.isfinite(trajectories).all()
     ):
-        raise ValueError("Candidate diversity needs finite [candidate,time,>=2] geometry")
+        raise ValueError(
+            "Candidate diversity needs finite [candidate,time,>=2] geometry"
+        )
     if tolerance_m <= 0:
         raise ValueError("Trajectory uniqueness tolerance must be positive")
     representatives: list[np.ndarray] = []
@@ -710,9 +1276,7 @@ def _candidate_diversity(
         "unique_trajectory_count": unique_count,
         "endpoint_spread_m": endpoint_spread,
         "ade_spread_m": float(ade.max() - ade.min()),
-        "recorded_collision_exposure_spread": float(
-            exposure.max() - exposure.min()
-        ),
+        "recorded_collision_exposure_spread": float(exposure.max() - exposure.min()),
         "nonzero_selection_opportunity": unique_count > 1,
     }
 
@@ -736,7 +1300,9 @@ def _selection_gate_configuration(protocol: FrozenProtocol) -> Mapping[str, Any]
         "observed_fraction_no_lower_than_candidate_0",
     }
     if set(gates) != expected_names:
-        raise ValueError("Frozen protocol selection acceptance gates are not supported exactly")
+        raise ValueError(
+            "Frozen protocol selection acceptance gates are not supported exactly"
+        )
     for name in (
         "candidate_0_collision_exposure_relative_reduction_minimum",
         "ade_degradation_m_paired_ci_95_upper_maximum",
@@ -748,7 +1314,9 @@ def _selection_gate_configuration(protocol: FrozenProtocol) -> Mapping[str, Any]
             or not math.isfinite(float(value))
             or float(value) < 0
         ):
-            raise ValueError(f"Frozen protocol selection gate {name} must be non-negative")
+            raise ValueError(
+                f"Frozen protocol selection gate {name} must be non-negative"
+            )
     for name in expected_names - {
         "candidate_0_collision_exposure_relative_reduction_minimum",
         "ade_degradation_m_paired_ci_95_upper_maximum",
@@ -861,6 +1429,7 @@ def _selection_gate_decisions(
 def evaluate_selection(
     *,
     protocol: str | Path,
+    forecast_comparison: str | Path,
     test_manifest: str | Path,
     train_manifest: str | Path,
     oracle_manifest: str | Path,
@@ -879,12 +1448,14 @@ def evaluate_selection(
     learned_path = Path(learned_selections).expanduser().resolve()
     persistence_path = Path(persistence_selections).expanduser().resolve()
     frozen_protocol = load_frozen_protocol(protocol)
+    protocol_weights = _protocol_rerank_weights(frozen_protocol)
     validate_uncertainty_configuration(
         frozen_protocol, replicates=bootstrap_replicates, seed=bootstrap_seed
     )
     _selection_gate_configuration(frozen_protocol)
     validation_path = Path(validation_manifest).expanduser().resolve()
     test_rows = load_manifest(test_path)
+    expected_evaluation_manifest = _evaluation_manifest_binding(test_path, test_rows)
     train_rows = load_manifest(train_path)
     _reject_split_leakage(test_rows, train_rows, "train")
     validation_rows = load_manifest(validation_path)
@@ -902,6 +1473,12 @@ def evaluate_selection(
             chunks=len({str(row["chunk_id"]) for row in rows}),
         )
     validate_source_manifest_binding(frozen_protocol, oracle_manifest_path)
+    forecast_report, forecast_provenance = _load_forecast_comparison(
+        forecast_comparison,
+        protocol=frozen_protocol,
+        test_manifest=test_path,
+        test_rows=test_rows,
+    )
 
     test_index = _index_rows(test_rows, "test manifest")
     oracle_index = _index_rows(load_manifest(oracle_manifest_path), "oracle manifest")
@@ -939,6 +1516,10 @@ def evaluate_selection(
         "persistence": [],
     }
     run_fingerprints: dict[str, list[str]] = {"learned": [], "persistence": []}
+    prediction_runs: dict[str, list[dict[str, Any]]] = {
+        "learned": [],
+        "persistence": [],
+    }
     selection_policies: dict[str, list[str]] = {
         "learned": [],
         "persistence": [],
@@ -985,37 +1566,45 @@ def evaluate_selection(
             ("test", test_row),
             ("oracle", oracle_row),
         ):
-            if "candidate_artifact_sha256" in manifest_row and str(
-                manifest_row["candidate_artifact_sha256"]
-            ) != candidate_record["artifact_sha256"]:
+            if (
+                "candidate_artifact_sha256" in manifest_row
+                and str(manifest_row["candidate_artifact_sha256"])
+                != candidate_record["artifact_sha256"]
+            ):
                 raise ValueError(
                     f"{manifest_name.capitalize()} manifest candidate SHA-256 mismatch "
                     f"for {identity[0]}@{identity[1]}"
                 )
-            if "oracle_safest_idx" in manifest_row and int(
-                manifest_row["oracle_safest_idx"]
-            ) != oracle["oracle_safest_idx"]:
+            if (
+                "oracle_safest_idx" in manifest_row
+                and int(manifest_row["oracle_safest_idx"])
+                != oracle["oracle_safest_idx"]
+            ):
                 raise ValueError(
                     f"{manifest_name.capitalize()} manifest safest index mismatch for "
                     f"{identity[0]}@{identity[1]}"
                 )
-            if "candidate_count" in manifest_row and int(
-                manifest_row["candidate_count"]
-            ) != oracle["candidate_count"]:
+            if (
+                "candidate_count" in manifest_row
+                and int(manifest_row["candidate_count"]) != oracle["candidate_count"]
+            ):
                 raise ValueError(
                     f"{manifest_name.capitalize()} manifest candidate count mismatch for "
                     f"{identity[0]}@{identity[1]}"
                 )
-            if "oracle_config_fingerprint" in manifest_row and str(
-                manifest_row["oracle_config_fingerprint"]
-            ) != oracle["oracle_config_fingerprint"]:
+            if (
+                "oracle_config_fingerprint" in manifest_row
+                and str(manifest_row["oracle_config_fingerprint"])
+                != oracle["oracle_config_fingerprint"]
+            ):
                 raise ValueError(
                     f"{manifest_name.capitalize()} manifest oracle configuration mismatch "
                     f"for {identity[0]}@{identity[1]}"
                 )
-            if "dataset_revision" in manifest_row and str(
-                manifest_row["dataset_revision"]
-            ) != oracle["dataset_revision"]:
+            if (
+                "dataset_revision" in manifest_row
+                and str(manifest_row["dataset_revision"]) != oracle["dataset_revision"]
+            ):
                 raise ValueError(
                     f"{manifest_name.capitalize()} manifest dataset revision mismatch for "
                     f"{identity[0]}@{identity[1]}"
@@ -1029,6 +1618,9 @@ def evaluate_selection(
                 source_oracle_sha,
                 oracle["candidate_count"],
                 method,
+                protocol_weights,
+                frozen_protocol,
+                expected_evaluation_manifest,
             )
             for method, path in (
                 ("learned", learned_path),
@@ -1066,7 +1658,9 @@ def evaluate_selection(
                             if metric in ("ade_m", "fde_m")
                             else (
                                 float(
-                                    oracle["risks"]["conflict_horizons"][candidate_index]
+                                    oracle["risks"]["conflict_horizons"][
+                                        candidate_index
+                                    ]
                                     > 0
                                 )
                                 if metric == "collision_clip_rate"
@@ -1092,7 +1686,9 @@ def evaluate_selection(
                 "candidate_count": oracle["candidate_count"],
                 "selected_indices": indices,
                 "comfort_only_scores": comfort_scores,
-                "learned_changed_from_candidate_0": bool(indices["learned_selected"] != 0),
+                "learned_changed_from_candidate_0": bool(
+                    indices["learned_selected"] != 0
+                ),
                 "learned_oracle_agreement": bool(
                     indices["learned_selected"] == indices["recorded_future_oracle"]
                 ),
@@ -1100,8 +1696,7 @@ def evaluate_selection(
                     indices["persistence_selected"] != 0
                 ),
                 "persistence_oracle_agreement": bool(
-                    indices["persistence_selected"]
-                    == indices["recorded_future_oracle"]
+                    indices["persistence_selected"] == indices["recorded_future_oracle"]
                 ),
                 "learned_persistence_agreement": bool(
                     indices["learned_selected"] == indices["persistence_selected"]
@@ -1126,6 +1721,7 @@ def evaluate_selection(
         for method, rerank in reranks.items():
             checkpoint_hashes[method].append(rerank["checkpoint_sha256"])
             run_fingerprints[method].append(rerank["prediction_run_fingerprint"])
+            prediction_runs[method].append(rerank["prediction_run"])
             selection_policies[method].append(rerank["selection_policy"])
             rerank_weights[method].append(rerank["weights"])
             prediction_provenance[method].append(
@@ -1167,6 +1763,10 @@ def evaluate_selection(
         method: _require_uniform(values, f"{method} prediction runs")
         for method, values in run_fingerprints.items()
     }
+    uniform_prediction_runs = {
+        method: _require_uniform(values, f"{method} prediction-run metadata")
+        for method, values in prediction_runs.items()
+    }
     uniform_policy = _require_uniform(
         selection_policies["learned"] + selection_policies["persistence"],
         "selection policies",
@@ -1191,9 +1791,7 @@ def evaluate_selection(
     policy_aggregates: dict[str, dict[str, float]] = {}
     for policy in POLICIES:
         policy_aggregates[policy] = {
-            metric: float(
-                np.mean([row["metrics"][policy][metric] for row in per_clip])
-            )
+            metric: float(np.mean([row["metrics"][policy][metric] for row in per_clip]))
             for metric in METRIC_METADATA
         }
 
@@ -1257,10 +1855,7 @@ def evaluate_selection(
             seed=bootstrap_seed,
         ),
         "persistence_change_from_candidate_0": cluster_bootstrap_interval(
-            [
-                float(row["persistence_changed_from_candidate_0"])
-                for row in per_clip
-            ],
+            [float(row["persistence_changed_from_candidate_0"]) for row in per_clip],
             cluster_ids,
             replicates=bootstrap_replicates,
             seed=bootstrap_seed,
@@ -1278,10 +1873,7 @@ def evaluate_selection(
             seed=bootstrap_seed,
         ),
         "comfort_only_change_from_candidate_0": cluster_bootstrap_interval(
-            [
-                float(row["comfort_only_changed_from_candidate_0"])
-                for row in per_clip
-            ],
+            [float(row["comfort_only_changed_from_candidate_0"]) for row in per_clip],
             cluster_ids,
             replicates=bootstrap_replicates,
             seed=bootstrap_seed,
@@ -1361,6 +1953,22 @@ def evaluate_selection(
             seed=bootstrap_seed,
         ),
     }
+    selection_gates = _selection_gate_decisions(
+        frozen_protocol, policy_aggregates, comparisons
+    )
+    forecast_gates = forecast_report["acceptance_gates"]
+    benchmark_acceptance = {
+        "all_passed": bool(
+            forecast_gates["all_passed"] and selection_gates["all_passed"]
+        ),
+        "rule": "forecast.all_passed and selection.all_passed",
+        "components": {
+            "forecast": {"all_passed": forecast_gates["all_passed"]},
+            "selection": {"all_passed": selection_gates["all_passed"]},
+        },
+    }
+    if sha256_file(forecast_provenance["path"]) != forecast_provenance["sha256"]:
+        raise ValueError("Forecast comparison changed while selection was evaluated")
     summary: dict[str, Any] = {
         "schema_version": OUTPUT_SCHEMA_VERSION,
         "protocol": frozen_protocol.provenance(),
@@ -1385,10 +1993,12 @@ def evaluate_selection(
             "learned": {
                 "checkpoint_sha256": uniform_checkpoints["learned"],
                 "prediction_run_fingerprint": uniform_runs["learned"],
+                "prediction_run": uniform_prediction_runs["learned"],
             },
             "persistence": {
                 "checkpoint_sha256": uniform_checkpoints["persistence"],
                 "prediction_run_fingerprint": uniform_runs["persistence"],
+                "prediction_run": uniform_prediction_runs["persistence"],
             },
             "selection_policy": uniform_policy,
             "reranker_weights": uniform_weights,
@@ -1405,9 +2015,8 @@ def evaluate_selection(
         "metric_metadata": METRIC_METADATA,
         "policy_macro_means": policy_aggregates,
         "paired_differences": comparisons,
-        "acceptance_gates": _selection_gate_decisions(
-            frozen_protocol, policy_aggregates, comparisons
-        ),
+        "acceptance_gates": selection_gates,
+        "benchmark_acceptance": benchmark_acceptance,
         "selection_rates": rates,
         "candidate_diversity": diversity_summary,
         "provenance": {
@@ -1423,10 +2032,9 @@ def evaluate_selection(
             "learned_selections_sha256": sha256_file(learned_path),
             "persistence_selections": str(persistence_path),
             "persistence_selections_sha256": sha256_file(persistence_path),
+            "forecast_comparison": forecast_provenance,
             "candidate_dir": str(Path(candidate_dir).expanduser().resolve()),
-            "candidate_subset_fingerprint": canonical_fingerprint(
-                candidate_provenance
-            ),
+            "candidate_subset_fingerprint": canonical_fingerprint(candidate_provenance),
             "oracle_subset_fingerprint": canonical_fingerprint(oracle_provenance),
             "learned_prediction_subset_fingerprint": canonical_fingerprint(
                 prediction_provenance["learned"]
@@ -1442,6 +2050,7 @@ def evaluate_selection(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--protocol", required=True)
+    parser.add_argument("--forecast-comparison", required=True)
     parser.add_argument("--test-manifest", required=True)
     parser.add_argument("--train-manifest", required=True)
     parser.add_argument("--validation-manifest", required=True)
@@ -1460,6 +2069,7 @@ def main() -> None:
     args = build_parser().parse_args()
     summary, per_clip = evaluate_selection(
         protocol=args.protocol,
+        forecast_comparison=args.forecast_comparison,
         test_manifest=args.test_manifest,
         train_manifest=args.train_manifest,
         validation_manifest=args.validation_manifest,
