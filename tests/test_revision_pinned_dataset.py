@@ -1,5 +1,7 @@
 import contextlib
 import io
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -36,6 +38,19 @@ class FakeInterface:
 
 
 class RevisionPinnedDatasetTest(unittest.TestCase):
+    def test_command_line_entry_points_import_revision_helper(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        for script_name in ("generate_candidates.py", "lidar_world_oracle.py"):
+            with self.subTest(script=script_name):
+                completed = subprocess.run(
+                    [sys.executable, str(project_root / "src" / script_name), "--help"],
+                    cwd=project_root,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_revision_qualified_dataset_path(self) -> None:
         self.assertEqual(
             revision_qualified_path("owner/data", "dataset", REVISION, "x/y.zip"),

@@ -27,7 +27,10 @@ import pandas as pd
 from scipy.ndimage import distance_transform_edt
 from scipy.spatial.transform import Rotation
 
-from src.revision_pinned_dataset import pin_streaming_revision
+if __package__:
+    from .revision_pinned_dataset import pin_streaming_revision
+else:
+    from revision_pinned_dataset import pin_streaming_revision
 
 
 DATASET_REVISION = "2ae73f49ffd2b5db43b404201beb7b92889f7afc"

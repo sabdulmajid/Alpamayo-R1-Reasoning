@@ -29,7 +29,10 @@ import numpy as np
 import pandas as pd
 import torch
 
-from src.revision_pinned_dataset import pin_streaming_revision
+if __package__:
+    from .revision_pinned_dataset import pin_streaming_revision
+else:
+    from revision_pinned_dataset import pin_streaming_revision
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
