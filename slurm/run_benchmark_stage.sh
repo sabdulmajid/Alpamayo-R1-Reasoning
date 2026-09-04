@@ -239,20 +239,36 @@ case "${ACTION}" in
             exit 2
         fi
         require_new_output "${OUTPUT}"
-        srun --nodes=1 --ntasks=1 "${PYTHON_BIN}" -m src.world_model.rerank \
-            --manifest "${TEST_MANIFEST}" \
-            --prediction-dir "${PREDICTIONS}" \
-            --output "${OUTPUT}" \
-            --collision-weight 10.0 \
-            --uncertainty-weight 1.0 \
-            --out-of-bounds-weight 5.0 \
-            --acceleration-weight 0.05 \
-            --jerk-weight 0.01 \
-            --curvature-weight 0.1 \
+        RERANK_COMMAND=(
+            "${PYTHON_BIN}" -m src.world_model.rerank
+            --manifest "${TEST_MANIFEST}"
+            --method "${METHOD}"
+            --prediction-dir "${PREDICTIONS}"
+            --output "${OUTPUT}"
+            --collision-weight 10.0
+            --uncertainty-weight 1.0
+            --out-of-bounds-weight 5.0
+            --acceleration-weight 0.05
+            --jerk-weight 0.01
+            --curvature-weight 0.1
             --progress-weight 0.02
+        )
+        if [[ "${METHOD}" == learned ]]; then
+            require_file "${RUN_DIR}/protocol.json"
+            require_file "${SELECTION}"
+            require_file "${EVALUATION_AUDIT}"
+            RERANK_COMMAND+=(
+                --protocol "${RUN_DIR}/protocol.json"
+                --selection-record "${SELECTION}"
+                --evaluation-audit "${EVALUATION_AUDIT}"
+            )
+        fi
+        srun --nodes=1 --ntasks=1 "${RERANK_COMMAND[@]}"
         ;;
     compare-forecasts)
         require_file "${RUN_DIR}/protocol.json"
+        require_file "${SELECTION}"
+        require_file "${EVALUATION_AUDIT}"
         require_file "${TRAIN_MANIFEST}"
         require_file "${VAL_MANIFEST}"
         require_file "${TEST_MANIFEST}"
@@ -261,6 +277,8 @@ case "${ACTION}" in
         srun --nodes=1 --ntasks=1 "${PYTHON_BIN}" -m src.world_model.compare_forecasts \
             --protocol "${RUN_DIR}/protocol.json" \
             --manifest "${TEST_MANIFEST}" \
+            --selection-record "${SELECTION}" \
+            --evaluation-audit "${EVALUATION_AUDIT}" \
             --learned-prediction-dir "${RUN_DIR}/predictions/learned" \
             --persistence-prediction-dir "${RUN_DIR}/predictions/persistence" \
             --output "${OUTPUT}" \
