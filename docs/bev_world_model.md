@@ -54,12 +54,14 @@ validation manifests. With very few chunks, a split can be empty; inspect
 
 ```bash
 python -m src.world_model.train \
+  --protocol results/world_model/protocol.json \
   --train-manifest results/world_model/splits/train.jsonl \
   --val-manifest results/world_model/splits/val.jsonl \
   --output-dir results/world_model/run_001 \
   --batch-size 4 --amp
 
 python -m src.world_model.train \
+  --protocol results/world_model/protocol.json \
   --train-manifest results/world_model/splits/train.jsonl \
   --val-manifest results/world_model/splits/val.jsonl \
   --output-dir results/world_model/run_001 \
@@ -82,14 +84,20 @@ manifest:
 
 ```bash
 python -m src.world_model.evaluate \
-  --manifest results/world_model/splits/test.jsonl --method learned \
+  --protocol results/world_model/protocol.json \
+  --manifest results/world_model/splits/test.jsonl \
+  --method learned --data-role test \
   --checkpoint results/world_model/run_001/best.pt \
+  --selection-record results/world_model/checkpoint_selection.json \
+  --evaluation-audit results/world_model/evaluation_partition.json \
   --output results/world_model/learned_test.json \
-  --prediction-dir results/world_model/predictions --amp
+  --prediction-dir results/world_model/predictions/learned --amp
 
 python -m src.world_model.evaluate \
   --manifest results/world_model/splits/test.jsonl --method persistence \
-  --output results/world_model/persistence_test.json
+  --data-role test \
+  --output results/world_model/persistence_test.json \
+  --prediction-dir results/world_model/predictions/persistence
 ```
 
 Metrics are visibility-masked IoU, precision, recall, histogram average
@@ -105,9 +113,19 @@ training data.
 
 ```bash
 python -m src.world_model.rerank \
-  --manifest results/world_oracle/manifests/all.jsonl \
-  --prediction-dir results/world_model/predictions \
-  --output results/world_model/reranked.jsonl
+  --manifest results/world_model/splits/test.jsonl \
+  --method learned \
+  --prediction-dir results/world_model/predictions/learned \
+  --protocol results/world_model/protocol.json \
+  --selection-record results/world_model/checkpoint_selection.json \
+  --evaluation-audit results/world_model/evaluation_partition.json \
+  --output results/world_model/reranked_learned.jsonl
+
+python -m src.world_model.rerank \
+  --manifest results/world_model/splits/test.jsonl \
+  --method persistence \
+  --prediction-dir results/world_model/predictions/persistence \
+  --output results/world_model/reranked_persistence.jsonl
 ```
 
 Reranking reads only predicted occupancy and deployable candidate information:
@@ -132,18 +150,65 @@ Both scripts execute workload commands through `srun` and default to one GPU on
 ```bash
 WORLD_TRAIN_MANIFEST=results/world_model/splits/train.jsonl \
 WORLD_VAL_MANIFEST=results/world_model/splits/val.jsonl \
+WORLD_PROTOCOL=results/world_model/protocol.json \
 WORLD_OUTPUT_DIR=results/world_model/run_001 \
 sbatch slurm/train_world_model.sh
 
 WORLD_EVAL_MANIFEST=results/world_model/splits/test.jsonl \
+WORLD_DATA_ROLE=test \
 WORLD_CHECKPOINT=results/world_model/run_001/best.pt \
+WORLD_PROTOCOL=results/world_model/protocol.json \
+WORLD_SELECTION_RECORD=results/world_model/checkpoint_selection.json \
+WORLD_EVALUATION_AUDIT=results/world_model/evaluation_partition.json \
 WORLD_METRICS_OUTPUT=results/world_model/learned_test.json \
-WORLD_PREDICTION_DIR=results/world_model/predictions \
+WORLD_PREDICTION_DIR=results/world_model/predictions/learned \
 sbatch slurm/evaluate_world_model.sh
 ```
 
 Set `WORLD_PYTHON_BIN` for the project interpreter and `WORLD_RESUME=auto` to
 resume. The scripts fail before training if input paths or CUDA are unavailable.
+
+### Full benchmark submission
+
+`slurm/submit_world_benchmark.sh` submits the complete dependency graph. It
+writes `submission.json` after SLURM accepts all jobs. The record contains the
+Git commit, Python executable and version, runtime values, job resources, job
+IDs, and all `afterok` dependencies.
+
+```bash
+BENCHMARK_REPO_ROOT="$(pwd)" \
+BENCHMARK_PYTHON="$CONDA_PREFIX/bin/python" \
+BENCHMARK_CLIP_PARQUET=/absolute/path/eval_clips_2k.parquet \
+BENCHMARK_CANDIDATE_DIR=/absolute/path/candidates_k6 \
+BENCHMARK_ORACLE_DIR=/absolute/path/lidar_world_oracle \
+BENCHMARK_RUN_DIR=/absolute/path/world_model_run \
+BENCHMARK_CANDIDATE_JOB_ID=<candidate-job-id> \
+bash slurm/submit_world_benchmark.sh
+```
+
+Use `BENCHMARK_ORACLE_JOB_ID` only to reuse an active or completed oracle job.
+Also set `BENCHMARK_ORACLE_SUBMISSION_RECORD` and
+`BENCHMARK_ORACLE_LINEAGE_RECORD`. The submission fails before `sbatch` if these
+records do not bind the same job, inputs, source, and resumed artifacts.
+
+The production graph targets the `dualcard` partition. Each configured node has
+two NVIDIA RTX A4500 GPUs, 24 CPUs, and 60,000 MB of scheduler memory. The
+resource plan is:
+
+| Stage | Concurrent jobs | GPU for each job | CPU for each job | Memory for each job |
+| --- | ---: | ---: | ---: | ---: |
+| LiDAR oracle | 8 array tasks | 0 | 3 | 7 GiB |
+| Prepare | 1 | 0 | 4 | 24 GiB |
+| Train seeds 2026 and 2027 | 2 | 1 | 4 | 28 GiB |
+| Select | 1 | 0 | 2 | 12 GiB |
+| Learned evaluation | 1 | 1 | 4 | 28 GiB |
+| Persistence evaluation | 1 | 0 | 4 | 16 GiB |
+| Rerank and compare | At most 3 | 0 | 4 | 16 GiB |
+| Final aggregation | 1 | 0 | 4 | 16 GiB |
+
+The two training jobs become eligible after the same preparation dependency.
+Together, they request both GPUs, 8 CPUs, and 56 GiB. Each GPU process must see
+exactly one NVIDIA RTX A4500. The stage exits if this condition is false.
 
 ## Decision gates
 

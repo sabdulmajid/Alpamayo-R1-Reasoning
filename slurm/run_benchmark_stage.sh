@@ -21,11 +21,26 @@ EXPECTED_SHARDS=${BENCHMARK_EXPECTED_SHARDS:-8}
 EXPECTED_ROWS=${BENCHMARK_EXPECTED_ROWS:-2000}
 EXPECTED_CANDIDATES=${BENCHMARK_EXPECTED_CANDIDATES:-6}
 SPLIT_SEED=${BENCHMARK_SPLIT_SEED:-2026}
-SPLIT_RATIOS=${BENCHMARK_SPLIT_RATIOS:-0.8,0.1,0.1}
+SPLIT_RATIOS=${BENCHMARK_SPLIT_RATIOS:-0.8:0.1:0.1}
+SPLIT_RATIOS=${SPLIT_RATIOS//:/,}
 EPOCHS=${BENCHMARK_EPOCHS:-30}
 BATCH_SIZE=${BENCHMARK_BATCH_SIZE:-4}
 WORKERS=${BENCHMARK_WORKERS:-4}
 BASE_CHANNELS=${BENCHMARK_BASE_CHANNELS:-16}
+LEARNING_RATE=${BENCHMARK_LEARNING_RATE:-0.0003}
+WEIGHT_DECAY=${BENCHMARK_WEIGHT_DECAY:-0.0001}
+BOOTSTRAP_REPLICATES=${BENCHMARK_BOOTSTRAP_REPLICATES:-10000}
+BOOTSTRAP_SEED=${BENCHMARK_BOOTSTRAP_SEED:-2026}
+FORECAST_THRESHOLD=${BENCHMARK_FORECAST_THRESHOLD:-0.5}
+AVERAGE_PRECISION_BINS=${BENCHMARK_AVERAGE_PRECISION_BINS:-1000}
+COLLISION_WEIGHT=${BENCHMARK_COLLISION_WEIGHT:-10.0}
+UNCERTAINTY_WEIGHT=${BENCHMARK_UNCERTAINTY_WEIGHT:-1.0}
+OUT_OF_BOUNDS_WEIGHT=${BENCHMARK_OUT_OF_BOUNDS_WEIGHT:-5.0}
+ACCELERATION_WEIGHT=${BENCHMARK_ACCELERATION_WEIGHT:-0.05}
+JERK_WEIGHT=${BENCHMARK_JERK_WEIGHT:-0.01}
+CURVATURE_WEIGHT=${BENCHMARK_CURVATURE_WEIGHT:-0.1}
+PROGRESS_WEIGHT=${BENCHMARK_PROGRESS_WEIGHT:-0.02}
+EXPECTED_GPU_NAME=${BENCHMARK_EXPECTED_GPU_NAME:-NVIDIA RTX A4500}
 EXPECTED_REPOSITORY_COMMIT=${BENCHMARK_REPOSITORY_COMMIT:?Set BENCHMARK_REPOSITORY_COMMIT}
 
 MERGED_MANIFEST=${RUN_DIR}/manifests/all.jsonl
@@ -103,11 +118,18 @@ PY
 
 verify_cuda() {
     srun --nodes=1 --ntasks=1 "${PYTHON_BIN}" - <<'PY'
+import os
 import torch
 
 if not torch.cuda.is_available():
     raise SystemExit("CUDA is unavailable")
-print(torch.cuda.get_device_name(0), torch.cuda.get_device_properties(0).total_memory)
+if torch.cuda.device_count() != 1:
+    raise SystemExit(f"Expected one visible GPU, found {torch.cuda.device_count()}")
+name = torch.cuda.get_device_name(0)
+expected = os.environ.get("BENCHMARK_EXPECTED_GPU_NAME", "NVIDIA RTX A4500")
+if name != expected:
+    raise SystemExit(f"Expected GPU {expected!r}, found {name!r}")
+print(name, torch.cuda.get_device_properties(0).total_memory)
 PY
 }
 
@@ -163,6 +185,8 @@ case "${ACTION}" in
             --batch-size "${BATCH_SIZE}"
             --workers "${WORKERS}"
             --base-channels "${BASE_CHANNELS}"
+            --learning-rate "${LEARNING_RATE}"
+            --weight-decay "${WEIGHT_DECAY}"
             --seed "${TRAIN_SEED}"
             --device cuda
             --amp
@@ -245,13 +269,13 @@ case "${ACTION}" in
             --method "${METHOD}"
             --prediction-dir "${PREDICTIONS}"
             --output "${OUTPUT}"
-            --collision-weight 10.0
-            --uncertainty-weight 1.0
-            --out-of-bounds-weight 5.0
-            --acceleration-weight 0.05
-            --jerk-weight 0.01
-            --curvature-weight 0.1
-            --progress-weight 0.02
+            --collision-weight "${COLLISION_WEIGHT}"
+            --uncertainty-weight "${UNCERTAINTY_WEIGHT}"
+            --out-of-bounds-weight "${OUT_OF_BOUNDS_WEIGHT}"
+            --acceleration-weight "${ACCELERATION_WEIGHT}"
+            --jerk-weight "${JERK_WEIGHT}"
+            --curvature-weight "${CURVATURE_WEIGHT}"
+            --progress-weight "${PROGRESS_WEIGHT}"
         )
         if [[ "${METHOD}" == learned ]]; then
             require_file "${RUN_DIR}/protocol.json"
@@ -282,10 +306,10 @@ case "${ACTION}" in
             --learned-prediction-dir "${RUN_DIR}/predictions/learned" \
             --persistence-prediction-dir "${RUN_DIR}/predictions/persistence" \
             --output "${OUTPUT}" \
-            --threshold 0.5 \
-            --ap-bins 1000 \
-            --bootstrap-replicates 10000 \
-            --bootstrap-seed 2026
+            --threshold "${FORECAST_THRESHOLD}" \
+            --ap-bins "${AVERAGE_PRECISION_BINS}" \
+            --bootstrap-replicates "${BOOTSTRAP_REPLICATES}" \
+            --bootstrap-seed "${BOOTSTRAP_SEED}"
         ;;
     aggregate)
         require_file "${TRAIN_MANIFEST}"
@@ -312,8 +336,8 @@ case "${ACTION}" in
             --candidate-dir "${CANDIDATE_DIR}" \
             --output "${OUTPUT}" \
             --per-clip-output "${PER_CLIP_OUTPUT}" \
-            --bootstrap-replicates 10000 \
-            --bootstrap-seed 2026
+            --bootstrap-replicates "${BOOTSTRAP_REPLICATES}" \
+            --bootstrap-seed "${BOOTSTRAP_SEED}"
         ;;
     *)
         echo "ERROR: unsupported BENCHMARK_ACTION: ${ACTION}" >&2

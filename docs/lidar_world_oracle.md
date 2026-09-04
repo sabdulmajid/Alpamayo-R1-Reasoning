@@ -121,6 +121,8 @@ sbatch --export=ALL slurm/build_lidar_world_oracle.sh
 The wrapper uses the currently accessible `dualcard` partition but does not
 request a GPU; decoding and rasterization are CPU workloads. Override the
 partition at submission time if cluster availability changes.
+The default array runs all eight shards at the same time. Each shard requests 3
+CPUs and 7 GiB. The total request is 24 CPUs and 56 GiB.
 
 ## Output contract
 
