@@ -284,6 +284,7 @@ case "${ACTION}" in
         mkdir -p "$(dirname -- "${PER_CLIP_OUTPUT}")"
         srun --nodes=1 --ntasks=1 "${PYTHON_BIN}" -m src.world_model.evaluate_selection \
             --protocol "${RUN_DIR}/protocol.json" \
+            --forecast-comparison "${RUN_DIR}/evaluation/forecast_comparison.json" \
             --test-manifest "${TEST_MANIFEST}" \
             --train-manifest "${TRAIN_MANIFEST}" \
             --validation-manifest "${VAL_MANIFEST}" \
