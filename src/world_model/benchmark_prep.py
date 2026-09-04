@@ -26,6 +26,12 @@ import pandas as pd
 import torch
 
 from .data import load_manifest, load_occupancy_artifact
+from .protocol import (
+    checkpoint_training_configuration,
+    load_frozen_protocol,
+    validate_protocol_provenance,
+    validate_training_run_configuration,
+)
 from .runtime import canonical_fingerprint, sha256_file
 from .split_manifest import SPLIT_NAMES, parse_ratios, split_rows
 
@@ -33,6 +39,7 @@ from .split_manifest import SPLIT_NAMES, parse_ratios, split_rows
 ORACLE_SCHEMA_VERSION = 4
 CHECKPOINT_SCHEMA_VERSION = 2
 PREPARATION_SCHEMA_VERSION = 1
+SELECTION_SCHEMA_VERSION = 2
 SOURCE_PARQUET_SHA256 = (
     "c5be3fd1f45574739e051f48d406968bec2495d76bb44d9e46451fcd5a0be3b8"
 )
@@ -659,6 +666,72 @@ def _checkpoint_record(label: str, run_dir: Path) -> dict[str, Any]:
         )
     if int(resume_signature.get("seed", -1)) != seed:
         raise ValueError(f"Checkpoint seed and resume signature differ for {label}")
+    training_configuration = checkpoint_training_configuration(checkpoint)
+    try:
+        protocol_path = Path(resume_signature["protocol"]["path"])
+    except (KeyError, TypeError) as error:
+        raise ValueError(f"Checkpoint protocol provenance is missing for {label}") from error
+    frozen_protocol = load_frozen_protocol(protocol_path)
+    protocol_provenance = validate_protocol_provenance(
+        frozen_protocol,
+        resume_signature.get("protocol"),
+        label=f"Checkpoint {label}",
+    )
+    validate_training_run_configuration(
+        frozen_protocol,
+        seed=seed,
+        configuration=training_configuration,
+    )
+
+    completion_path = (run_dir / "completion.json").resolve()
+    try:
+        completion_bytes = completion_path.read_bytes()
+        completion = json.loads(completion_bytes)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"Invalid training completion record for {label}") from error
+    if not isinstance(completion, dict):
+        raise ValueError(f"Training completion record must be an object for {label}")
+    completion_fingerprint = str(completion.get("completion_fingerprint", ""))
+    completion_payload = dict(completion)
+    completion_payload.pop("completion_fingerprint", None)
+    if (
+        not _SHA256_PATTERN.fullmatch(completion_fingerprint)
+        or canonical_fingerprint(completion_payload) != completion_fingerprint
+    ):
+        raise ValueError(f"Training completion fingerprint is invalid for {label}")
+    latest_path = (run_dir / "latest.pt").resolve()
+    expected_completion = {
+        "schema_version": 1,
+        "status": "completed",
+        "seed": seed,
+        "epochs": training_configuration["epochs"],
+        "final_epoch": training_configuration["epochs"] - 1,
+        "protocol": protocol_provenance,
+        "latest_checkpoint": str(latest_path),
+        "latest_checkpoint_sha256": sha256_file(latest_path),
+        "best_checkpoint": str(checkpoint_path),
+        "best_checkpoint_sha256": sha256_file(checkpoint_path),
+    }
+    if completion_payload != expected_completion:
+        raise ValueError(f"Training completion record does not match run {label}")
+    latest = torch.load(latest_path, map_location="cpu", weights_only=False)
+    latest_history = latest.get("history")
+    try:
+        completed_epochs = [int(record["epoch"]) for record in latest_history]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"Latest checkpoint history is invalid for {label}") from error
+    if (
+        latest.get("checkpoint_schema_version") != CHECKPOINT_SCHEMA_VERSION
+        or int(latest.get("epoch", -1)) != training_configuration["epochs"] - 1
+        or completed_epochs != list(range(training_configuration["epochs"]))
+        or latest.get("seed") != seed
+        or latest.get("resume_signature") != resume_signature
+        or latest.get("data_provenance") != data_provenance
+        or latest.get("model_config") != model_config
+        or latest.get("data_schema") != data_schema
+        or checkpoint_training_configuration(latest) != training_configuration
+    ):
+        raise ValueError(f"Latest checkpoint does not prove completed training for {label}")
     return {
         "label": label,
         "run_directory": str(run_dir.resolve()),
@@ -673,6 +746,17 @@ def _checkpoint_record(label: str, run_dir: Path) -> dict[str, Any]:
         "validation_dataset_fingerprint": data_provenance["val"]["dataset_fingerprint"],
         "model_config": model_config,
         "data_schema": data_schema,
+        "training_configuration": training_configuration,
+        "protocol": protocol_provenance,
+        "training_completion": {
+            "path": str(completion_path),
+            "sha256": hashlib.sha256(completion_bytes).hexdigest(),
+            "completion_fingerprint": completion_fingerprint,
+            "latest_checkpoint": str(latest_path),
+            "latest_checkpoint_sha256": expected_completion[
+                "latest_checkpoint_sha256"
+            ],
+        },
         "comparison_signature": {
             key: value for key, value in resume_signature.items() if key != "seed"
         },
@@ -698,6 +782,8 @@ def select_checkpoint(runs: Sequence[tuple[str, Path]]) -> dict[str, Any]:
         "validation_dataset_fingerprint",
         "model_config",
         "data_schema",
+        "training_configuration",
+        "protocol",
         "comparison_signature",
     )
     for record in records[1:]:
@@ -716,9 +802,10 @@ def select_checkpoint(runs: Sequence[tuple[str, Path]]) -> dict[str, Any]:
     )
     selected = records[0]
     payload: dict[str, Any] = {
-        "schema_version": PREPARATION_SCHEMA_VERSION,
+        "schema_version": SELECTION_SCHEMA_VERSION,
         "selection_policy": "minimum_best_validation_loss",
         "test_metrics_used": False,
+        "protocol": selected["protocol"],
         "selected_label": selected["label"],
         "selected_seed": selected["seed"],
         "selected_checkpoint": selected["checkpoint"],
@@ -739,6 +826,8 @@ def verify_evaluation_partition(
     selection_file = selection_path.expanduser().resolve()
     try:
         selection = json.loads(selection_file.read_text(encoding="utf-8"))
+        if selection["schema_version"] != SELECTION_SCHEMA_VERSION:
+            raise ValueError("unsupported selection schema")
         checkpoint_path = Path(selection["selected_checkpoint"]).resolve()
         expected_checkpoint_sha256 = str(selection["selected_checkpoint_sha256"])
         fingerprint = str(selection["selection_fingerprint"])
@@ -750,6 +839,16 @@ def verify_evaluation_partition(
     fingerprint_payload.pop("selection_fingerprint", None)
     if canonical_fingerprint(fingerprint_payload) != fingerprint:
         raise ValueError("Checkpoint selection fingerprint does not match its payload")
+    try:
+        protocol_path = Path(selection["protocol"]["path"])
+    except (KeyError, TypeError) as error:
+        raise ValueError("Checkpoint selection has no protocol provenance") from error
+    frozen_protocol = load_frozen_protocol(protocol_path)
+    protocol_provenance = validate_protocol_provenance(
+        frozen_protocol,
+        selection.get("protocol"),
+        label="Checkpoint selection record",
+    )
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Selected checkpoint not found: {checkpoint_path}")
     if sha256_file(checkpoint_path) != expected_checkpoint_sha256:
@@ -781,6 +880,7 @@ def verify_evaluation_partition(
         "selection": str(selection_file),
         "selection_sha256": sha256_file(selection_file),
         "selection_fingerprint": fingerprint,
+        "protocol": protocol_provenance,
         "checkpoint": str(checkpoint_path),
         "checkpoint_sha256": expected_checkpoint_sha256,
         "test_manifest": str(test_manifest.expanduser().resolve()),

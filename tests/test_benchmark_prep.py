@@ -15,7 +15,7 @@ from src.world_model.benchmark_prep import (
     select_checkpoint,
     verify_evaluation_partition,
 )
-from src.world_model.runtime import sha256_file
+from src.world_model.runtime import canonical_fingerprint, sha256_file
 from src.world_model.split_manifest import SPLIT_NAMES, assign_group
 
 
@@ -290,7 +290,42 @@ class ManifestPreparationTest(unittest.TestCase):
 
 def write_checkpoint(run_dir: Path, *, seed: int, best_loss: float) -> None:
     run_dir.mkdir(parents=True)
+    protocol_path = run_dir.parent / "protocol.json"
+    if not protocol_path.exists():
+        protocol = {
+            "schema_version": 1,
+            "status": "frozen_before_test_evaluation",
+            "source_data": {},
+            "split": {},
+            "training": {
+                "seeds": [2026, 2027],
+                "epochs": 5,
+                "batch_size": 4,
+                "workers": 2,
+                "base_channels": 16,
+                "automatic_mixed_precision": True,
+                "learning_rate": 3e-4,
+                "weight_decay": 1e-4,
+                "checkpoint_selection": "minimum_best_validation_loss",
+                "test_metrics_used_for_selection": False,
+            },
+            "forecast_evaluation": {},
+            "trajectory_selection": {},
+            "uncertainty": {},
+            "acceptance_gates": {},
+        }
+        protocol["protocol_fingerprint"] = canonical_fingerprint(protocol)
+        protocol_path.write_text(
+            json.dumps(protocol, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+    protocol_provenance = {
+        "path": str(protocol_path.resolve()),
+        "sha256": sha256_file(protocol_path),
+        "protocol_fingerprint": protocol["protocol_fingerprint"],
+    }
     resume_signature = {
+        "protocol": protocol_provenance,
         "train_manifest": "/benchmark/train.jsonl",
         "train_manifest_sha256": "d" * 64,
         "train_dataset_fingerprint": "e" * 64,
@@ -299,30 +334,65 @@ def write_checkpoint(run_dir: Path, *, seed: int, best_loss: float) -> None:
         "val_dataset_fingerprint": "1" * 64,
         "batch_size": 4,
         "base_channels": 16,
+        "learning_rate": 3e-4,
+        "weight_decay": 1e-4,
+        "amp": True,
         "seed": seed,
     }
-    torch.save(
-        {
-            "checkpoint_schema_version": 2,
-            "epoch": 4,
-            "best_val_loss": best_loss,
-            "seed": seed,
-            "history": [{"epoch": 4, "val": {"loss": best_loss}}],
-            "resume_signature": resume_signature,
-            "data_provenance": {
-                "train": {
-                    "dataset_fingerprint": "e" * 64,
-                    "chunk_ids": ["chunk-train"],
-                },
-                "val": {
-                    "dataset_fingerprint": "1" * 64,
-                    "chunk_ids": ["chunk-val"],
-                },
-            },
-            "model_config": {"base_channels": 16},
-            "data_schema": {"coordinate_frame": "ego_at_t0"},
+    checkpoint = {
+        "checkpoint_schema_version": 2,
+        "epoch": 4,
+        "best_val_loss": best_loss,
+        "seed": seed,
+        "history": [
+            {
+                "epoch": epoch,
+                "val": {"loss": best_loss if epoch == 4 else best_loss + 1.0},
+            }
+            for epoch in range(5)
+        ],
+        "resume_signature": resume_signature,
+        "run_config": {
+            "epochs": 5,
+            "batch_size": 4,
+            "workers": 2,
+            "base_channels": 16,
+            "amp": True,
+            "learning_rate": 3e-4,
+            "weight_decay": 1e-4,
         },
-        run_dir / "best.pt",
+        "data_provenance": {
+            "train": {
+                "dataset_fingerprint": "e" * 64,
+                "chunk_ids": ["chunk-train"],
+            },
+            "val": {
+                "dataset_fingerprint": "1" * 64,
+                "chunk_ids": ["chunk-val"],
+            },
+        },
+        "model_config": {"base_channels": 16},
+        "data_schema": {"coordinate_frame": "ego_at_t0"},
+    }
+    best_path = run_dir / "best.pt"
+    latest_path = run_dir / "latest.pt"
+    torch.save(checkpoint, best_path)
+    torch.save(checkpoint, latest_path)
+    completion = {
+        "schema_version": 1,
+        "status": "completed",
+        "seed": seed,
+        "epochs": 5,
+        "final_epoch": 4,
+        "protocol": protocol_provenance,
+        "latest_checkpoint": str(latest_path.resolve()),
+        "latest_checkpoint_sha256": sha256_file(latest_path),
+        "best_checkpoint": str(best_path.resolve()),
+        "best_checkpoint_sha256": sha256_file(best_path),
+    }
+    completion["completion_fingerprint"] = canonical_fingerprint(completion)
+    (run_dir / "completion.json").write_text(
+        json.dumps(completion, sort_keys=True) + "\n", encoding="utf-8"
     )
 
 
@@ -336,9 +406,14 @@ class CheckpointSelectionTest(unittest.TestCase):
                 (("seed-2026", root / "seed-2026"), ("seed-2027", root / "seed-2027"))
             )
             self.assertEqual(result["selected_seed"], 2027)
+            self.assertEqual(result["schema_version"], 2)
             self.assertEqual(result["selection_policy"], "minimum_best_validation_loss")
             self.assertFalse(result["test_metrics_used"])
             self.assertEqual(len(result["selected_checkpoint_sha256"]), 64)
+            self.assertEqual(result["protocol"], result["runs"][0]["protocol"])
+            self.assertTrue(
+                all("training_completion" in run for run in result["runs"])
+            )
 
             result_path = root / "selection.json"
             result_path.write_text(json.dumps(result), encoding="utf-8")
@@ -388,6 +463,40 @@ class CheckpointSelectionTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "distinct random seeds"):
                 select_checkpoint(
                     (("first", root / "first"), ("second", root / "second"))
+                )
+
+    def test_selection_requires_completed_protocol_bound_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_checkpoint(root / "seed-2026", seed=2026, best_loss=0.4)
+            write_checkpoint(root / "seed-2027", seed=2027, best_loss=0.3)
+            (root / "seed-2027" / "completion.json").unlink()
+            with self.assertRaisesRegex(ValueError, "completion record"):
+                select_checkpoint(
+                    (
+                        ("seed-2026", root / "seed-2026"),
+                        ("seed-2027", root / "seed-2027"),
+                    )
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_checkpoint(root / "seed-2026", seed=2026, best_loss=0.4)
+            write_checkpoint(root / "seed-2027", seed=2027, best_loss=0.3)
+            protocol_path = root / "protocol.json"
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+            protocol["training"]["epochs"] = 6
+            protocol.pop("protocol_fingerprint")
+            protocol["protocol_fingerprint"] = canonical_fingerprint(protocol)
+            protocol_path.write_text(
+                json.dumps(protocol, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "requested frozen protocol"):
+                select_checkpoint(
+                    (
+                        ("seed-2026", root / "seed-2026"),
+                        ("seed-2027", root / "seed-2027"),
+                    )
                 )
 
 

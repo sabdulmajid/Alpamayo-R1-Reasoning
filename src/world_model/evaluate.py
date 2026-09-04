@@ -17,6 +17,15 @@ from .baselines import persistence
 from .data import OccupancyDataset, dataset_provenance, reject_chunk_overlap
 from .metrics import OccupancyMetricAccumulator
 from .model import ModelConfig, TemporalOccupancyNet
+from .protocol import (
+    FrozenProtocol,
+    checkpoint_training_configuration,
+    load_frozen_protocol,
+    normalize_training_configuration,
+    validate_manifest_binding,
+    validate_protocol_provenance,
+    validate_training_binding,
+)
 from .runtime import (
     atomic_save_npz,
     canonical_fingerprint,
@@ -30,7 +39,7 @@ from .runtime import (
 
 PREDICTION_SCHEMA_VERSION = 2
 CHECKPOINT_SCHEMA_VERSION = 2
-SELECTION_SCHEMA_VERSION = 1
+SELECTION_SCHEMA_VERSION = 2
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -46,6 +55,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--evaluation-audit",
         help="Evaluation-partition audit JSON required for learned test evaluation",
+    )
+    parser.add_argument(
+        "--protocol",
+        help="Frozen benchmark protocol JSON required for learned test evaluation",
     )
     parser.add_argument("--output", required=True, help="Metrics JSON path")
     parser.add_argument(
@@ -106,21 +119,174 @@ def _require_exact_path(value: Any, expected: Path, label: str) -> None:
         )
 
 
-def _selected_run_record(selection: dict[str, Any]) -> dict[str, Any]:
-    runs = selection.get("runs")
-    if not isinstance(runs, list) or not runs:
-        raise ValueError("Checkpoint selection record has no compared training runs")
-    selected_label = selection.get("selected_label")
-    matches = [
-        run
-        for run in runs
-        if isinstance(run, dict) and run.get("label") == selected_label
-    ]
-    if len(matches) != 1:
-        raise ValueError(
-            "Checkpoint selection record does not identify one selected training run"
+def _validate_training_completion(
+    run: dict[str, Any], protocol: FrozenProtocol
+) -> None:
+    label = str(run["label"])
+    record = run.get("training_completion")
+    if not isinstance(record, dict):
+        raise ValueError(f"Checkpoint selection run {label} has no training completion")
+    try:
+        completion_path, completion, completion_sha256 = _read_json_record(
+            record["path"], f"training completion for {label}"
         )
-    return matches[0]
+        recorded_sha256 = _require_sha256(
+            record["sha256"], f"Training completion SHA-256 for {label}"
+        )
+        recorded_fingerprint = _require_sha256(
+            record["completion_fingerprint"],
+            f"Training completion fingerprint for {label}",
+        )
+    except KeyError as error:
+        raise ValueError(
+            f"Checkpoint selection run {label} has incomplete training completion"
+        ) from error
+    if completion_sha256 != recorded_sha256:
+        raise ValueError(f"Training completion bytes differ for {label}")
+    fingerprint_payload = dict(completion)
+    completion_fingerprint = _require_sha256(
+        fingerprint_payload.pop("completion_fingerprint", None),
+        f"Training completion fingerprint for {label}",
+    )
+    if (
+        completion_fingerprint != recorded_fingerprint
+        or canonical_fingerprint(fingerprint_payload) != completion_fingerprint
+    ):
+        raise ValueError(f"Training completion fingerprint does not match for {label}")
+    configuration = normalize_training_configuration(
+        run["training_configuration"],
+        label=f"Checkpoint selection run {label} training_configuration",
+    )
+    checkpoint_path = Path(str(run["checkpoint"])).expanduser().resolve()
+    latest_path = Path(str(record.get("latest_checkpoint", ""))).expanduser().resolve()
+    if not checkpoint_path.is_file() or sha256_file(checkpoint_path) != run[
+        "checkpoint_sha256"
+    ]:
+        raise ValueError(f"Compared checkpoint bytes differ for {label}")
+    if not latest_path.is_file() or sha256_file(latest_path) != record.get(
+        "latest_checkpoint_sha256"
+    ):
+        raise ValueError(f"Latest checkpoint bytes differ for {label}")
+    expected = {
+        "schema_version": 1,
+        "status": "completed",
+        "seed": run["seed"],
+        "epochs": configuration["epochs"],
+        "final_epoch": configuration["epochs"] - 1,
+        "protocol": protocol.provenance(),
+        "latest_checkpoint": str(latest_path),
+        "latest_checkpoint_sha256": record["latest_checkpoint_sha256"],
+        "best_checkpoint": str(checkpoint_path),
+        "best_checkpoint_sha256": run["checkpoint_sha256"],
+    }
+    if fingerprint_payload != expected:
+        raise ValueError(f"Training completion record does not match run {label}")
+
+
+def _validated_selection_runs(
+    selection: dict[str, Any], protocol: FrozenProtocol
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Validate the complete comparison and return its ordered winner."""
+
+    runs = selection.get("runs")
+    if not isinstance(runs, list) or len(runs) < 2:
+        raise ValueError(
+            "Checkpoint selection record needs at least two compared training runs"
+        )
+    if not all(isinstance(run, dict) for run in runs):
+        raise ValueError("Checkpoint selection runs must be objects")
+
+    labels: list[str] = []
+    seeds: list[int] = []
+    for index, run in enumerate(runs):
+        label = run.get("label")
+        seed = run.get("seed")
+        loss = run.get("best_validation_loss")
+        if not isinstance(label, str) or not label:
+            raise ValueError(f"Checkpoint selection run {index} has an invalid label")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError(f"Checkpoint selection run {label} has an invalid seed")
+        if isinstance(loss, bool) or not isinstance(loss, (int, float)):
+            raise ValueError(
+                f"Checkpoint selection run {label} has an invalid validation loss"
+            )
+        loss_value = float(loss)
+        if not np.isfinite(loss_value) or loss_value < 0:
+            raise ValueError(
+                f"Checkpoint selection run {label} has an invalid validation loss"
+            )
+        for field in (
+            "checkpoint_sha256",
+            "train_manifest_sha256",
+            "validation_manifest_sha256",
+            "train_dataset_fingerprint",
+            "validation_dataset_fingerprint",
+        ):
+            _require_sha256(run.get(field), f"Selection run {label} {field}")
+        for field in ("model_config", "data_schema", "comparison_signature"):
+            if not isinstance(run.get(field), dict):
+                raise ValueError(f"Checkpoint selection run {label} has no {field}")
+        normalize_training_configuration(
+            run.get("training_configuration"),
+            label=f"Checkpoint selection run {label} training_configuration",
+        )
+        validate_protocol_provenance(
+            protocol,
+            run.get("protocol"),
+            label=f"Checkpoint selection run {label}",
+        )
+        _validate_training_completion(run, protocol)
+        labels.append(label)
+        seeds.append(seed)
+
+    if len(set(labels)) != len(labels):
+        raise ValueError("Checkpoint selection run labels must be unique")
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("Checkpoint selection runs must use distinct random seeds")
+    comparison_fields = (
+        "train_manifest_sha256",
+        "validation_manifest_sha256",
+        "train_dataset_fingerprint",
+        "validation_dataset_fingerprint",
+        "model_config",
+        "data_schema",
+        "training_configuration",
+        "protocol",
+        "comparison_signature",
+    )
+    reference = runs[0]
+    for run in runs[1:]:
+        for field in comparison_fields:
+            if run[field] != reference[field]:
+                raise ValueError(f"Checkpoint selection runs differ in {field}")
+
+    ordered = sorted(
+        runs,
+        key=lambda run: (
+            float(run["best_validation_loss"]),
+            int(run["seed"]),
+            str(run["label"]),
+        ),
+    )
+    if runs != ordered:
+        raise ValueError("Checkpoint selection runs are not in selection order")
+    selected_label = selection.get("selected_label")
+    if selected_label != ordered[0]["label"]:
+        raise ValueError(
+            "Checkpoint selection does not name the minimum validation-loss run"
+        )
+    configuration = normalize_training_configuration(
+        reference["training_configuration"],
+        label="Checkpoint selection training_configuration",
+    )
+    validate_training_binding(
+        protocol,
+        seeds=sorted(seeds),
+        configuration=configuration,
+        selection_policy=str(selection.get("selection_policy", "")),
+        test_metrics_used=bool(selection.get("test_metrics_used")),
+    )
+    return runs, ordered[0]
 
 
 def _validate_selection_record(
@@ -131,6 +297,7 @@ def _validate_selection_record(
     checkpoint_path: Path,
     checkpoint_sha256: str,
     checkpoint: dict[str, Any],
+    protocol: FrozenProtocol,
 ) -> dict[str, Any]:
     """Bind a checkpoint to its validation-only selection record."""
 
@@ -153,6 +320,13 @@ def _validate_selection_record(
     fingerprint_payload.pop("selection_fingerprint", None)
     if canonical_fingerprint(fingerprint_payload) != selection_fingerprint:
         raise ValueError("Checkpoint selection fingerprint does not match its payload")
+    validate_protocol_provenance(
+        protocol,
+        selection.get("protocol"),
+        label="Checkpoint selection record",
+    )
+
+    _, selected_run = _validated_selection_runs(selection, protocol)
 
     try:
         _require_exact_path(
@@ -189,7 +363,6 @@ def _validate_selection_record(
     ):
         raise ValueError("Selected validation loss differs from checkpoint")
 
-    selected_run = _selected_run_record(selection)
     selected_label = str(selection["selected_label"])
     try:
         _require_exact_path(
@@ -228,6 +401,11 @@ def _validate_selection_record(
             "validation_dataset_fingerprint": provenance["val"]["dataset_fingerprint"],
             "model_config": checkpoint["model_config"],
             "data_schema": checkpoint["data_schema"],
+            "training_configuration": checkpoint_training_configuration(checkpoint),
+            "protocol": protocol.provenance(),
+            "comparison_signature": {
+                key: value for key, value in signature.items() if key != "seed"
+            },
         }
     except (KeyError, TypeError) as error:
         raise ValueError("Checkpoint has incomplete training provenance") from error
@@ -250,6 +428,7 @@ def _validate_selection_record(
 
 def validate_learned_test_binding(
     *,
+    protocol: str | Path,
     selection_record: str | Path,
     evaluation_audit: str | Path,
     checkpoint_path: Path,
@@ -261,6 +440,16 @@ def validate_learned_test_binding(
 ) -> dict[str, Any]:
     """Validate immutable selection and held-out partition records."""
 
+    frozen_protocol = load_frozen_protocol(protocol)
+    validate_manifest_binding(
+        frozen_protocol,
+        "test",
+        manifest_path,
+        actual_sha256=manifest_sha256,
+        clips=int(evaluation_provenance["artifact_count"]),
+        chunks=len(evaluation_provenance["chunk_ids"]),
+        dataset_fingerprint=str(evaluation_provenance["dataset_fingerprint"]),
+    )
     selection_path, selection, selection_sha256 = _read_json_record(
         selection_record, "checkpoint selection record"
     )
@@ -271,6 +460,7 @@ def validate_learned_test_binding(
         checkpoint_path=checkpoint_path,
         checkpoint_sha256=checkpoint_sha256,
         checkpoint=checkpoint,
+        protocol=frozen_protocol,
     )
     audit_path, audit, audit_sha256 = _read_json_record(
         evaluation_audit, "evaluation partition audit"
@@ -322,8 +512,14 @@ def validate_learned_test_binding(
         ) from error
     if audit_selection_fingerprint != selection_metadata["selection_fingerprint"]:
         raise ValueError("Evaluation audit selection fingerprint does not match")
+    validate_protocol_provenance(
+        frozen_protocol,
+        audit.get("protocol"),
+        label="Evaluation partition audit",
+    )
 
     return {
+        "protocol": frozen_protocol.provenance(),
         "checkpoint_selection": selection_metadata,
         "evaluation_audit": {
             "path": str(audit_path),
@@ -426,6 +622,7 @@ def main() -> None:
         missing_records = [
             flag
             for flag, value in (
+                ("--protocol", args.protocol),
                 ("--selection-record", args.selection_record),
                 ("--evaluation-audit", args.evaluation_audit),
             )
@@ -435,9 +632,10 @@ def main() -> None:
             raise ValueError(
                 "Learned test evaluation requires " + " and ".join(missing_records)
             )
-    elif args.selection_record or args.evaluation_audit:
+    elif args.protocol or args.selection_record or args.evaluation_audit:
         raise ValueError(
-            "--selection-record and --evaluation-audit are only valid for learned test evaluation"
+            "--protocol, --selection-record, and --evaluation-audit are only valid "
+            "for learned test evaluation"
         )
     if args.method == "persistence" and args.checkpoint:
         raise ValueError("--checkpoint is only valid for method=learned")
@@ -470,6 +668,7 @@ def main() -> None:
     checkpoint_path: Path | None = None
     checkpoint: dict[str, Any] | None = None
     record_binding: dict[str, Any] = {
+        "protocol": None,
         "checkpoint_selection": None,
         "evaluation_audit": None,
     }
@@ -515,7 +714,9 @@ def main() -> None:
             partition_isolation["validation_evaluation_chunk_overlap"] = 0
             assert args.selection_record is not None
             assert args.evaluation_audit is not None
+            assert args.protocol is not None
             record_binding = validate_learned_test_binding(
+                protocol=args.protocol,
                 selection_record=args.selection_record,
                 evaluation_audit=args.evaluation_audit,
                 checkpoint_path=checkpoint_path,

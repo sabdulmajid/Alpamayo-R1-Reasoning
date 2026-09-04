@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import dataclass
@@ -50,8 +51,9 @@ def load_frozen_protocol(path: str | Path) -> FrozenProtocol:
 
     protocol_path = Path(path).expanduser().resolve()
     try:
-        payload = json.loads(protocol_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        content = protocol_path.read_bytes()
+        payload = json.loads(content)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError(f"Invalid frozen protocol: {protocol_path}") from error
     if not isinstance(payload, dict):
         raise ValueError("Frozen protocol must be a JSON object")
@@ -78,10 +80,180 @@ def load_frozen_protocol(path: str | Path) -> FrozenProtocol:
         _mapping(payload.get(section), section)
     return FrozenProtocol(
         path=protocol_path,
-        sha256=sha256_file(protocol_path),
+        sha256=hashlib.sha256(content).hexdigest(),
         fingerprint=fingerprint,
         payload=payload,
     )
+
+
+def normalize_training_configuration(
+    value: Any, *, label: str
+) -> dict[str, Any]:
+    """Validate and normalize the shared training-configuration fields."""
+
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be an object")
+
+    def integer(name: str, *, minimum: int) -> int:
+        item = value.get(name)
+        if isinstance(item, bool) or not isinstance(item, int) or item < minimum:
+            raise ValueError(f"{label} {name} is invalid")
+        return item
+
+    def finite_number(name: str, *, minimum: float, inclusive: bool) -> float:
+        item = value.get(name)
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise ValueError(f"{label} {name} is invalid")
+        result = float(item)
+        valid_bound = result >= minimum if inclusive else result > minimum
+        if not math.isfinite(result) or not valid_bound:
+            raise ValueError(f"{label} {name} is invalid")
+        return result
+
+    amp = value.get("automatic_mixed_precision")
+    if not isinstance(amp, bool):
+        raise ValueError(f"{label} automatic_mixed_precision is invalid")
+    normalized = {
+        "epochs": integer("epochs", minimum=1),
+        "batch_size": integer("batch_size", minimum=1),
+        "workers": integer("workers", minimum=0),
+        "base_channels": integer("base_channels", minimum=1),
+        "automatic_mixed_precision": amp,
+        "learning_rate": finite_number(
+            "learning_rate", minimum=0.0, inclusive=False
+        ),
+        "weight_decay": finite_number(
+            "weight_decay", minimum=0.0, inclusive=True
+        ),
+    }
+    if canonical_fingerprint(value) != canonical_fingerprint(normalized):
+        raise ValueError(f"{label} is not supported exactly")
+    return normalized
+
+
+def checkpoint_training_configuration(
+    checkpoint: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the protocol-visible training configuration in a checkpoint."""
+
+    run_config = checkpoint.get("run_config")
+    resume_signature = checkpoint.get("resume_signature")
+    model_config = checkpoint.get("model_config")
+    if not all(
+        isinstance(item, dict)
+        for item in (run_config, resume_signature, model_config)
+    ):
+        raise ValueError("Checkpoint has incomplete training configuration")
+
+    def integer(name: str, *, minimum: int) -> int:
+        value = run_config.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(f"Checkpoint training {name} is invalid")
+        return value
+
+    def finite_number(name: str, *, minimum: float, inclusive: bool) -> float:
+        value = run_config.get(name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"Checkpoint training {name} is invalid")
+        result = float(value)
+        valid_bound = result >= minimum if inclusive else result > minimum
+        if not math.isfinite(result) or not valid_bound:
+            raise ValueError(f"Checkpoint training {name} is invalid")
+        return result
+
+    amp = run_config.get("amp")
+    if not isinstance(amp, bool):
+        raise ValueError("Checkpoint training amp is invalid")
+    configuration = normalize_training_configuration({
+        "epochs": integer("epochs", minimum=1),
+        "batch_size": integer("batch_size", minimum=1),
+        "workers": integer("workers", minimum=0),
+        "base_channels": integer("base_channels", minimum=1),
+        "automatic_mixed_precision": amp,
+        "learning_rate": finite_number(
+            "learning_rate", minimum=0.0, inclusive=False
+        ),
+        "weight_decay": finite_number(
+            "weight_decay", minimum=0.0, inclusive=True
+        ),
+    }, label="Checkpoint training configuration")
+    resume_bindings = {
+        "batch_size": configuration["batch_size"],
+        "base_channels": configuration["base_channels"],
+        "amp": configuration["automatic_mixed_precision"],
+        "learning_rate": configuration["learning_rate"],
+        "weight_decay": configuration["weight_decay"],
+    }
+    for name, expected in resume_bindings.items():
+        if resume_signature.get(name) != expected:
+            raise ValueError(
+                f"Checkpoint run configuration and resume signature differ in {name}"
+            )
+    if model_config.get("base_channels") != configuration["base_channels"]:
+        raise ValueError(
+            "Checkpoint run configuration and model configuration differ in base_channels"
+        )
+    return configuration
+
+
+def validate_training_binding(
+    protocol: FrozenProtocol,
+    *,
+    seeds: list[int],
+    configuration: Mapping[str, Any],
+    selection_policy: str,
+    test_metrics_used: bool,
+) -> None:
+    """Bind all recorded training runs to the frozen training protocol."""
+
+    expected = {
+        "seeds": seeds,
+        **dict(configuration),
+        "checkpoint_selection": selection_policy,
+        "test_metrics_used_for_selection": test_metrics_used,
+    }
+    require_exact_mapping(protocol.payload["training"], expected, "training")
+
+
+def validate_training_run_configuration(
+    protocol: FrozenProtocol,
+    *,
+    seed: int,
+    configuration: Mapping[str, Any],
+) -> None:
+    """Require one training invocation to conform to the frozen protocol."""
+
+    training = _mapping(protocol.payload["training"], "training")
+    seeds = training.get("seeds")
+    if (
+        not isinstance(seeds, list)
+        or len(seeds) < 2
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in seeds)
+        or len(set(seeds)) != len(seeds)
+    ):
+        raise ValueError("Frozen protocol training seeds are invalid")
+    if seed not in seeds:
+        raise ValueError(f"Training seed {seed} is absent from the frozen protocol")
+    validate_training_binding(
+        protocol,
+        seeds=seeds,
+        configuration=configuration,
+        selection_policy="minimum_best_validation_loss",
+        test_metrics_used=False,
+    )
+
+
+def validate_protocol_provenance(
+    protocol: FrozenProtocol, value: Any, *, label: str
+) -> dict[str, str]:
+    """Require an embedded record to identify these exact protocol bytes."""
+
+    expected = protocol.provenance()
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} protocol provenance must be an object")
+    if canonical_fingerprint(value) != canonical_fingerprint(expected):
+        raise ValueError(f"{label} does not bind the requested frozen protocol")
+    return expected
 
 
 def validate_manifest_binding(

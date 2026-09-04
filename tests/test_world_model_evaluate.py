@@ -1,9 +1,11 @@
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from src.world_model.evaluate import validate_learned_test_binding
+from src.world_model.evaluate import main, validate_learned_test_binding
 from src.world_model.runtime import canonical_fingerprint, sha256_file
 
 
@@ -24,6 +26,67 @@ class BindingFixture:
             encoding="utf-8",
         )
         self.manifest_sha256 = sha256_file(self.manifest_path)
+        self.evaluation_provenance = {
+            "artifact_count": 2,
+            "chunk_ids": ["test-a", "test-b"],
+            "dataset_fingerprint": "f" * 64,
+        }
+        training_configuration = {
+            "epochs": 5,
+            "batch_size": 4,
+            "workers": 2,
+            "base_channels": 16,
+            "automatic_mixed_precision": True,
+            "learning_rate": 3e-4,
+            "weight_decay": 1e-4,
+        }
+        self.protocol_path = (root / "protocol.json").resolve()
+        self.protocol = {
+            "schema_version": 1,
+            "status": "frozen_before_test_evaluation",
+            "source_data": {},
+            "split": {
+                "unit": "chunk_id",
+                "manifests": {
+                    "test": {
+                        "path": str(self.manifest_path),
+                        "sha256": self.manifest_sha256,
+                        "clips": 2,
+                        "chunks": 2,
+                        "dataset_fingerprint": self.evaluation_provenance[
+                            "dataset_fingerprint"
+                        ],
+                    }
+                },
+            },
+            "training": {
+                "seeds": [2026, 2027],
+                **training_configuration,
+                "checkpoint_selection": "minimum_best_validation_loss",
+                "test_metrics_used_for_selection": False,
+            },
+            "forecast_evaluation": {},
+            "trajectory_selection": {},
+            "uncertainty": {},
+            "acceptance_gates": {},
+        }
+        self.protocol["protocol_fingerprint"] = canonical_fingerprint(self.protocol)
+        _write_json(self.protocol_path, self.protocol)
+        protocol_provenance = {
+            "path": str(self.protocol_path),
+            "sha256": sha256_file(self.protocol_path),
+            "protocol_fingerprint": self.protocol["protocol_fingerprint"],
+        }
+        comparison_signature = {
+            "protocol": protocol_provenance,
+            "train_manifest_sha256": "a" * 64,
+            "val_manifest_sha256": "b" * 64,
+            "batch_size": 4,
+            "base_channels": 16,
+            "amp": True,
+            "learning_rate": 3e-4,
+            "weight_decay": 1e-4,
+        }
         self.checkpoint = {
             "epoch": 4,
             "seed": 2027,
@@ -31,8 +94,17 @@ class BindingFixture:
             "model_config": {"base_channels": 16},
             "data_schema": {"coordinate_frame": "ego_at_t0"},
             "resume_signature": {
-                "train_manifest_sha256": "a" * 64,
-                "val_manifest_sha256": "b" * 64,
+                **comparison_signature,
+                "seed": 2027,
+            },
+            "run_config": {
+                "epochs": 5,
+                "batch_size": 4,
+                "workers": 2,
+                "base_channels": 16,
+                "amp": True,
+                "learning_rate": 3e-4,
+                "weight_decay": 1e-4,
             },
             "data_provenance": {
                 "train": {
@@ -58,19 +130,55 @@ class BindingFixture:
             "validation_dataset_fingerprint": "d" * 64,
             "model_config": {"base_channels": 16},
             "data_schema": {"coordinate_frame": "ego_at_t0"},
+            "training_configuration": training_configuration,
+            "protocol": protocol_provenance,
+            "comparison_signature": comparison_signature,
         }
+        other_checkpoint = (root / "other.pt").resolve()
+        other_checkpoint.write_bytes(b"other checkpoint bytes")
         other_run = {
             **selected_run,
             "label": "seed-2026",
-            "checkpoint": str((root / "other.pt").resolve()),
-            "checkpoint_sha256": "e" * 64,
+            "checkpoint": str(other_checkpoint),
+            "checkpoint_sha256": sha256_file(other_checkpoint),
             "seed": 2026,
             "best_validation_loss": 0.5,
         }
+
+        def add_completion(run: dict) -> None:
+            label = str(run["label"])
+            latest_path = (root / f"{label}-latest.pt").resolve()
+            latest_path.write_bytes(f"latest {label}".encode())
+            completion = {
+                "schema_version": 1,
+                "status": "completed",
+                "seed": run["seed"],
+                "epochs": 5,
+                "final_epoch": 4,
+                "protocol": protocol_provenance,
+                "latest_checkpoint": str(latest_path),
+                "latest_checkpoint_sha256": sha256_file(latest_path),
+                "best_checkpoint": run["checkpoint"],
+                "best_checkpoint_sha256": run["checkpoint_sha256"],
+            }
+            completion["completion_fingerprint"] = canonical_fingerprint(completion)
+            completion_path = (root / f"{label}-completion.json").resolve()
+            _write_json(completion_path, completion)
+            run["training_completion"] = {
+                "path": str(completion_path),
+                "sha256": sha256_file(completion_path),
+                "completion_fingerprint": completion["completion_fingerprint"],
+                "latest_checkpoint": str(latest_path),
+                "latest_checkpoint_sha256": sha256_file(latest_path),
+            }
+
+        add_completion(selected_run)
+        add_completion(other_run)
         self.selection = {
-            "schema_version": 1,
+            "schema_version": 2,
             "selection_policy": "minimum_best_validation_loss",
             "test_metrics_used": False,
+            "protocol": protocol_provenance,
             "selected_label": "seed-2027",
             "selected_seed": 2027,
             "selected_checkpoint": str(self.checkpoint_path),
@@ -86,6 +194,7 @@ class BindingFixture:
             "selection": str(self.selection_path),
             "selection_sha256": sha256_file(self.selection_path),
             "selection_fingerprint": self.selection["selection_fingerprint"],
+            "protocol": protocol_provenance,
             "checkpoint": str(self.checkpoint_path),
             "checkpoint_sha256": self.checkpoint_sha256,
             "test_manifest": str(self.manifest_path),
@@ -97,11 +206,6 @@ class BindingFixture:
         }
         self.audit_path = (root / "audit.json").resolve()
         _write_json(self.audit_path, self.audit)
-        self.evaluation_provenance = {
-            "artifact_count": 2,
-            "chunk_ids": ["test-a", "test-b"],
-            "dataset_fingerprint": "f" * 64,
-        }
 
     def rewrite_selection(self) -> None:
         payload = dict(self.selection)
@@ -109,10 +213,26 @@ class BindingFixture:
         self.selection["selection_fingerprint"] = canonical_fingerprint(payload)
         _write_json(self.selection_path, self.selection)
         self.audit["selection_sha256"] = sha256_file(self.selection_path)
+        self.audit["selection_fingerprint"] = self.selection[
+            "selection_fingerprint"
+        ]
         _write_json(self.audit_path, self.audit)
+
+    def rewrite_completion(self, run_index: int) -> None:
+        run = self.selection["runs"][run_index]
+        record = run["training_completion"]
+        path = Path(record["path"])
+        completion = json.loads(path.read_text(encoding="utf-8"))
+        completion["seed"] = run["seed"]
+        completion.pop("completion_fingerprint", None)
+        completion["completion_fingerprint"] = canonical_fingerprint(completion)
+        _write_json(path, completion)
+        record["sha256"] = sha256_file(path)
+        record["completion_fingerprint"] = completion["completion_fingerprint"]
 
     def validate(self) -> dict:
         return validate_learned_test_binding(
+            protocol=self.protocol_path,
             selection_record=self.selection_path,
             evaluation_audit=self.audit_path,
             checkpoint_path=self.checkpoint_path,
@@ -141,6 +261,134 @@ class LearnedTestBindingTest(unittest.TestCase):
                 binding["checkpoint_selection"]["selection_fingerprint"],
                 fixture.selection["selection_fingerprint"],
             )
+            self.assertEqual(binding["protocol"]["path"], str(fixture.protocol_path))
+
+    def test_rejects_incomplete_or_nonwinning_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = BindingFixture(Path(temporary))
+            fixture.selection["runs"] = fixture.selection["runs"][:1]
+            fixture.rewrite_selection()
+            with self.assertRaisesRegex(ValueError, "at least two"):
+                fixture.validate()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = BindingFixture(Path(temporary))
+            selected, competitor = fixture.selection["runs"]
+            competitor["best_validation_loss"] = 0.1
+            fixture.selection["runs"] = [competitor, selected]
+            fixture.rewrite_selection()
+            with self.assertRaisesRegex(ValueError, "minimum validation-loss"):
+                fixture.validate()
+
+    def test_rejects_duplicate_or_incomparable_runs_and_invalid_losses(self) -> None:
+        mutations = (
+            ("label", "labels must be unique"),
+            ("seed", "distinct random seeds"),
+            ("configuration", "runs differ in model_config"),
+            ("loss", "invalid validation loss"),
+        )
+        for mutation, message in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                fixture = BindingFixture(Path(temporary))
+                first, second = fixture.selection["runs"]
+                if mutation == "label":
+                    second["label"] = first["label"]
+                elif mutation == "seed":
+                    second["seed"] = first["seed"]
+                    fixture.rewrite_completion(1)
+                elif mutation == "configuration":
+                    second["model_config"] = {"base_channels": 32}
+                else:
+                    second["best_validation_loss"] = "not-finite"
+                fixture.rewrite_selection()
+                with self.assertRaisesRegex(ValueError, message):
+                    fixture.validate()
+
+    def test_rejects_protocol_manifest_and_training_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = BindingFixture(Path(temporary))
+            copied_protocol = (Path(temporary) / "copied-protocol.json").resolve()
+            copied_protocol.write_bytes(fixture.protocol_path.read_bytes())
+            with self.assertRaisesRegex(ValueError, "requested frozen protocol"):
+                validate_learned_test_binding(
+                    protocol=copied_protocol,
+                    selection_record=fixture.selection_path,
+                    evaluation_audit=fixture.audit_path,
+                    checkpoint_path=fixture.checkpoint_path,
+                    checkpoint_sha256=fixture.checkpoint_sha256,
+                    checkpoint=fixture.checkpoint,
+                    manifest_path=fixture.manifest_path,
+                    manifest_sha256=fixture.manifest_sha256,
+                    evaluation_provenance=fixture.evaluation_provenance,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = BindingFixture(Path(temporary))
+            fixture.protocol["training"]["epochs"] = 6
+            fixture.protocol.pop("protocol_fingerprint")
+            fixture.protocol["protocol_fingerprint"] = canonical_fingerprint(
+                fixture.protocol
+            )
+            _write_json(fixture.protocol_path, fixture.protocol)
+            with self.assertRaisesRegex(ValueError, "requested frozen protocol"):
+                fixture.validate()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = BindingFixture(Path(temporary))
+            copied_manifest = (Path(temporary) / "copied-test.jsonl").resolve()
+            copied_manifest.write_bytes(fixture.manifest_path.read_bytes())
+            with self.assertRaisesRegex(ValueError, "test manifest path differs"):
+                validate_learned_test_binding(
+                    protocol=fixture.protocol_path,
+                    selection_record=fixture.selection_path,
+                    evaluation_audit=fixture.audit_path,
+                    checkpoint_path=fixture.checkpoint_path,
+                    checkpoint_sha256=fixture.checkpoint_sha256,
+                    checkpoint=fixture.checkpoint,
+                    manifest_path=copied_manifest,
+                    manifest_sha256=sha256_file(copied_manifest),
+                    evaluation_provenance=fixture.evaluation_provenance,
+                )
+
+    def test_cli_requires_protocol_only_for_learned_test(self) -> None:
+        cases = (
+            (
+                [
+                    "evaluate",
+                    "--manifest",
+                    "missing.jsonl",
+                    "--method",
+                    "learned",
+                    "--checkpoint",
+                    "missing.pt",
+                    "--selection-record",
+                    "selection.json",
+                    "--evaluation-audit",
+                    "audit.json",
+                    "--output",
+                    "output.json",
+                ],
+                "requires --protocol",
+            ),
+            (
+                [
+                    "evaluate",
+                    "--manifest",
+                    "missing.jsonl",
+                    "--method",
+                    "persistence",
+                    "--protocol",
+                    "protocol.json",
+                    "--output",
+                    "output.json",
+                ],
+                "only valid for learned test evaluation",
+            ),
+        )
+        for arguments, message in cases:
+            with self.subTest(message=message), patch.object(sys, "argv", arguments):
+                with self.assertRaisesRegex(ValueError, message):
+                    main()
 
     def test_rejects_selection_payload_without_matching_fingerprint(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -178,7 +426,7 @@ class LearnedTestBindingTest(unittest.TestCase):
             ("path", "path .* does not match"),
             ("sha", "SHA-256 does not match"),
             ("epoch", "epoch or seed differs"),
-            ("provenance", "does not match checkpoint provenance"),
+            ("provenance", "train_dataset_fingerprint"),
         )
         for mutation, message in mutations:
             with (
