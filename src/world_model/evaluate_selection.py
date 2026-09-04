@@ -55,6 +55,12 @@ COMFORT_COMPONENTS = {
     "max_curvature_inv_m": ("curvature", 1.0),
     "progress_m": ("progress", -1.0),
 }
+RERANK_VALUE_TOLERANCES = {
+    # Candidate trajectories are stored as float32. Small platform differences in
+    # heading deltas are amplified when divided by short trajectory segments.
+    "max_curvature_inv_m": (1e-6, 1e-4),
+}
+DEFAULT_RERANK_VALUE_TOLERANCE = (1e-7, 1e-9)
 METRIC_METADATA: dict[str, dict[str, str]] = {
     "ade_m": {"unit": "m", "preferred_direction": "lower"},
     "fde_m": {"unit": "m", "preferred_direction": "lower"},
@@ -1161,16 +1167,46 @@ def _validate_rerank_row(
                 f"{identity[0]}@{identity[1]}"
             )
         for name, expected in expected_score.items():
+            if name == "score":
+                continue
             actual = _finite(
                 score.get(name), f"rerank candidate {candidate_index} {name}"
             )
-            if not np.isclose(actual, expected, rtol=1e-7, atol=1e-9):
+            rtol, atol = RERANK_VALUE_TOLERANCES.get(
+                name, DEFAULT_RERANK_VALUE_TOLERANCE
+            )
+            if not np.isclose(actual, expected, rtol=rtol, atol=atol):
                 raise ValueError(
                     f"Rerank candidate {candidate_index} {name} differs from "
                     f"recomputation for {identity[0]}@{identity[1]}"
                 )
+        saved_curvature = _finite(
+            score.get("max_curvature_inv_m"),
+            f"rerank candidate {candidate_index} max_curvature_inv_m",
+        )
+        recomputed_curvature = float(expected_score["max_curvature_inv_m"])
+        curvature_adjusted_score = float(expected_score["score"]) + (
+            expected_weights.curvature
+            * (saved_curvature - recomputed_curvature)
+        )
+        saved_score = _finite(
+            score.get("score"), f"rerank candidate {candidate_index} score"
+        )
+        if not np.isclose(
+            saved_score,
+            curvature_adjusted_score,
+            rtol=DEFAULT_RERANK_VALUE_TOLERANCE[0],
+            atol=DEFAULT_RERANK_VALUE_TOLERANCE[1],
+        ):
+            raise ValueError(
+                f"Rerank candidate {candidate_index} score differs from "
+                f"recomputation for {identity[0]}@{identity[1]}"
+            )
         components = {
-            component: float(expected_score[component])
+            # Keep the authenticated serialized values so replay produces the
+            # same per-clip audit bytes on platforms with different float32
+            # curvature roundoff.
+            component: float(score[component])
             for component in COMFORT_COMPONENTS
         }
         comfort_components.append(components)

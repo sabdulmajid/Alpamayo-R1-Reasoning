@@ -1011,6 +1011,54 @@ class HeldOutSelectionEvaluationTest(unittest.TestCase):
             ):
                 fixture.evaluate()
 
+    def test_accepts_bounded_cross_platform_curvature_roundoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SelectionFixture(Path(temporary))
+            curvature_delta = 8e-5
+            score_delta = 8e-6
+            for row in fixture.rerank_rows + fixture.persistence_rows:
+                row["candidate_scores"][0][
+                    "max_curvature_inv_m"
+                ] += curvature_delta
+                row["candidate_scores"][0]["score"] += score_delta
+            _write_jsonl(fixture.learned_selections, fixture.rerank_rows)
+            _write_jsonl(fixture.persistence_selections, fixture.persistence_rows)
+            summary, per_clip = fixture.evaluate()
+            saved = fixture.rerank_rows[0]["candidate_scores"][0]
+            expected_comfort_score = (
+                0.05 * saved["mean_acceleration_mps2"]
+                + 0.01 * saved["mean_jerk_mps3"]
+                + 0.1 * saved["max_curvature_inv_m"]
+                - 0.02 * saved["progress_m"]
+            )
+        self.assertIn("benchmark_acceptance", summary)
+        self.assertAlmostEqual(
+            per_clip[0]["comfort_only_scores"][0], expected_comfort_score
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SelectionFixture(Path(temporary))
+            fixture.rerank_rows[0]["candidate_scores"][0][
+                "max_curvature_inv_m"
+            ] += 2e-4
+            _write_jsonl(fixture.learned_selections, fixture.rerank_rows)
+            with self.assertRaisesRegex(
+                ValueError,
+                "candidate 0 max_curvature_inv_m differs from recomputation",
+            ):
+                fixture.evaluate()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SelectionFixture(Path(temporary))
+            fixture.rerank_rows[0]["candidate_scores"][0][
+                "max_curvature_inv_m"
+            ] += 8e-5
+            _write_jsonl(fixture.learned_selections, fixture.rerank_rows)
+            with self.assertRaisesRegex(
+                ValueError, "candidate 0 score differs from recomputation"
+            ):
+                fixture.evaluate()
+
     def test_rejects_reranker_metadata_that_differs_from_prediction(self) -> None:
         for field in ("checkpoint_sha256", "prediction_run_fingerprint"):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
