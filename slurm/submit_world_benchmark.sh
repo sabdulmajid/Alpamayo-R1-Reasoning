@@ -16,6 +16,9 @@ EXPECTED_SHARDS=${BENCHMARK_EXPECTED_SHARDS:-8}
 EXPECTED_ROWS=${BENCHMARK_EXPECTED_ROWS:-2000}
 EXPECTED_CANDIDATES=${BENCHMARK_EXPECTED_CANDIDATES:-6}
 EPOCHS=${BENCHMARK_EPOCHS:-30}
+ORACLE_CONCURRENCY=${BENCHMARK_ORACLE_CONCURRENCY:-2}
+ORACLE_CPUS=${BENCHMARK_ORACLE_CPUS:-4}
+ORACLE_MEMORY=${BENCHMARK_ORACLE_MEMORY:-24G}
 
 if [[ -n "${EXISTING_ORACLE_JOB_ID}" ]]; then
     if [[ ! "${EXISTING_ORACLE_JOB_ID}" =~ ^[0-9]+$ ]]; then
@@ -24,6 +27,14 @@ if [[ -n "${EXISTING_ORACLE_JOB_ID}" ]]; then
     fi
 elif [[ ! "${CANDIDATE_JOB_ID}" =~ ^[0-9]+$ ]]; then
     echo "ERROR: set a numeric BENCHMARK_CANDIDATE_JOB_ID or BENCHMARK_ORACLE_JOB_ID" >&2
+    exit 2
+fi
+if [[ ! "${ORACLE_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: BENCHMARK_ORACLE_CONCURRENCY must be a positive integer" >&2
+    exit 2
+fi
+if [[ ! "${ORACLE_CPUS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: BENCHMARK_ORACLE_CPUS must be a positive integer" >&2
     exit 2
 fi
 if ! command -v sbatch >/dev/null 2>&1; then
@@ -49,6 +60,11 @@ CANDIDATE_DIR=$(cd -- "${CANDIDATE_DIR}" && pwd)
 ORACLE_DIR=$(cd -- "${ORACLE_DIR}" && pwd)
 RUN_DIR=$(cd -- "${RUN_DIR}" && pwd)
 CLIP_PARQUET=$(realpath "${CLIP_PARQUET}")
+if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain)" ]]; then
+    echo "ERROR: benchmark repository must be clean before submission" >&2
+    exit 2
+fi
+REPOSITORY_COMMIT=$(git -C "${REPO_ROOT}" rev-parse --verify HEAD)
 
 normalize_job_id() {
     local value=$1
@@ -66,10 +82,10 @@ else
     ORACLE_JOB=$(normalize_job_id "$(
         sbatch --parsable \
             --dependency="afterok:${CANDIDATE_JOB_ID}" \
-            --array="0-$((EXPECTED_SHARDS - 1))%2" \
+            --array="0-$((EXPECTED_SHARDS - 1))%${ORACLE_CONCURRENCY}" \
             --time=20:00:00 \
-            --mem=24G \
-            --cpus-per-task=4 \
+            --mem="${ORACLE_MEMORY}" \
+            --cpus-per-task="${ORACLE_CPUS}" \
             --job-name=world-oracle-2k \
             --output="${RUN_DIR}/logs/oracle-%A_%a.out" \
             --error="${RUN_DIR}/logs/oracle-%A_%a.err" \
@@ -218,6 +234,7 @@ export CANDIDATE_JOB_ID EXISTING_ORACLE_JOB_ID ORACLE_JOB PREP_JOB TRAIN_2026_JO
 export PERSISTENCE_JOB SELECT_JOB LEARNED_JOB LEARNED_RERANK_JOB
 export PERSISTENCE_RERANK_JOB FORECAST_COMPARE_JOB AGGREGATE_JOB RUN_DIR REPO_ROOT CLIP_PARQUET
 export CANDIDATE_DIR ORACLE_DIR EPOCHS EXPECTED_ROWS EXPECTED_CANDIDATES EXPECTED_SHARDS
+export ORACLE_CONCURRENCY ORACLE_CPUS ORACLE_MEMORY REPOSITORY_COMMIT
 "${PYTHON_BIN}" - <<'PY'
 import json
 import os
@@ -238,7 +255,7 @@ keys = (
     "AGGREGATE_JOB",
 )
 payload = {
-    "schema_version": 1,
+    "schema_version": 2,
     "jobs": {key.lower(): int(os.environ[key]) for key in keys},
     "paths": {
         "repository": os.environ["REPO_ROOT"],
@@ -252,12 +269,16 @@ payload = {
         "expected_rows": int(os.environ["EXPECTED_ROWS"]),
         "expected_candidates": int(os.environ["EXPECTED_CANDIDATES"]),
         "expected_oracle_shards": int(os.environ["EXPECTED_SHARDS"]),
+        "oracle_concurrency": int(os.environ["ORACLE_CONCURRENCY"]),
+        "oracle_cpus_per_task": int(os.environ["ORACLE_CPUS"]),
+        "oracle_memory_per_task": os.environ["ORACLE_MEMORY"],
         "training_seeds": [2026, 2027],
         "maximum_concurrent_gpu_jobs": 2,
         "gpus_per_training_job": 1,
         "model_sharding": False,
         "reused_oracle_job": bool(os.environ["EXISTING_ORACLE_JOB_ID"]),
     },
+    "source": {"repository_commit": os.environ["REPOSITORY_COMMIT"]},
 }
 payload["jobs"]["candidate_job_id"] = (
     int(os.environ["CANDIDATE_JOB_ID"])
