@@ -22,8 +22,10 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+import torch
 
 from .data import load_manifest, load_occupancy_artifact, write_jsonl
+from .evaluate import CHECKPOINT_SCHEMA_VERSION, validate_learned_test_binding
 from .protocol import (
     FrozenProtocol,
     load_frozen_protocol,
@@ -374,25 +376,6 @@ def _resolve_row_path(row: Mapping[str, Any], key: str, parent: Path) -> Path:
     return path.resolve()
 
 
-def _read_bound_json(
-    path_value: Any, expected_sha256: Any, label: str
-) -> dict[str, Any]:
-    """Read one referenced JSON record and require its exact recorded bytes."""
-
-    path = Path(str(path_value)).expanduser().resolve()
-    if not path.is_file():
-        raise ValueError(f"Prediction {label} does not exist: {path}")
-    if not _valid_sha256(expected_sha256) or sha256_file(path) != expected_sha256:
-        raise ValueError(f"Prediction {label} SHA-256 does not match")
-    try:
-        payload = json.loads(path.read_bytes())
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(f"Prediction {label} is not valid JSON: {path}") from error
-    if not isinstance(payload, dict):
-        raise ValueError(f"Prediction {label} must be a JSON object")
-    return payload
-
-
 def _validate_prediction_run(
     prediction_path: Path,
     *,
@@ -518,9 +501,10 @@ def _validate_prediction_run(
         "partition_isolation",
         "binding_fingerprint",
     }
+    supported_binding_fields = common_binding_fields | {"protocol"}
     if not isinstance(binding, dict) or set(binding) not in (
         common_binding_fields,
-        common_binding_fields | {"protocol"},
+        supported_binding_fields,
     ):
         raise ValueError(
             "Prediction evaluation-binding fields are not supported exactly"
@@ -537,12 +521,6 @@ def _validate_prediction_run(
     ) != canonical_fingerprint(dict(evaluation_manifest)):
         raise ValueError("Prediction run uses a different test-manifest binding")
 
-    protocol_record = binding.get("protocol")
-    if protocol_record is not None and canonical_fingerprint(
-        protocol_record
-    ) != canonical_fingerprint(protocol.provenance()):
-        raise ValueError("Prediction run protocol provenance does not match")
-
     checkpoint = binding.get("checkpoint")
     selection = binding.get("checkpoint_selection")
     audit = binding.get("evaluation_audit")
@@ -553,6 +531,13 @@ def _validate_prediction_run(
     }:
         raise ValueError("Prediction partition-isolation record is incomplete")
     if expected_method == "learned":
+        if set(binding) != supported_binding_fields:
+            raise ValueError("Learned prediction has no protocol provenance")
+        protocol_record = binding["protocol"]
+        if canonical_fingerprint(protocol_record) != canonical_fingerprint(
+            protocol.provenance()
+        ):
+            raise ValueError("Prediction run protocol provenance does not match")
         checkpoint_fields = {
             "path",
             "sha256",
@@ -586,85 +571,6 @@ def _validate_prediction_run(
             raise ValueError(
                 "Learned prediction partition isolation is not demonstrated"
             )
-
-        selection_record = _read_bound_json(
-            selection.get("path"), selection.get("sha256"), "checkpoint selection"
-        )
-        record_fingerprint = selection_record.get("selection_fingerprint")
-        record_payload = dict(selection_record)
-        record_payload.pop("selection_fingerprint", None)
-        if (
-            not _valid_sha256(record_fingerprint)
-            or canonical_fingerprint(record_payload) != record_fingerprint
-            or selection.get("selection_fingerprint") != record_fingerprint
-        ):
-            raise ValueError(
-                "Prediction checkpoint-selection fingerprint does not match"
-            )
-        if selection_record.get("selected_checkpoint_sha256") != expected_checkpoint:
-            raise ValueError(
-                "Prediction checkpoint selection chose a different checkpoint"
-            )
-        if (
-            Path(str(selection_record.get("selected_checkpoint")))
-            .expanduser()
-            .resolve()
-            != Path(str(checkpoint["path"])).expanduser().resolve()
-        ):
-            raise ValueError("Prediction checkpoint selection chose a different path")
-        if (
-            selection_record.get("selected_epoch") != checkpoint["epoch"]
-            or selection_record.get("selected_seed") != checkpoint["seed"]
-        ):
-            raise ValueError("Prediction checkpoint selection metadata does not match")
-        for name in (
-            "selected_label",
-            "selected_seed",
-            "selected_epoch",
-            "selected_validation_loss",
-        ):
-            if selection.get(name) != selection_record.get(name):
-                raise ValueError(
-                    f"Prediction checkpoint-selection {name} does not match its record"
-                )
-
-        audit_record = _read_bound_json(
-            audit.get("path"), audit.get("sha256"), "evaluation audit"
-        )
-        if audit.get("record_fingerprint") != canonical_fingerprint(audit_record):
-            raise ValueError("Prediction evaluation-audit fingerprint does not match")
-        if (
-            audit.get("selection_fingerprint") != record_fingerprint
-            or audit_record.get("selection_fingerprint") != record_fingerprint
-        ):
-            raise ValueError("Prediction evaluation audit binds a different selection")
-        audit_expectations = {
-            "selection": str(Path(str(selection["path"])).expanduser().resolve()),
-            "selection_sha256": selection["sha256"],
-            "test_manifest": evaluation_manifest["path"],
-            "test_manifest_sha256": evaluation_manifest["sha256"],
-            "test_clips": evaluation_manifest["clips"],
-            "test_chunks": evaluation_manifest["chunks"],
-            "checkpoint_sha256": expected_checkpoint,
-            "train_test_chunk_overlap": 0,
-            "validation_test_chunk_overlap": 0,
-        }
-        for name, expected in audit_expectations.items():
-            actual = audit_record.get(name)
-            if name in {"selection", "test_manifest"}:
-                actual = str(Path(str(actual)).expanduser().resolve())
-            if actual != expected:
-                raise ValueError(f"Prediction evaluation audit {name} does not match")
-        if (
-            Path(str(audit_record.get("checkpoint"))).expanduser().resolve()
-            != Path(str(checkpoint["path"])).expanduser().resolve()
-        ):
-            raise ValueError(
-                "Prediction evaluation audit checkpoint path does not match"
-            )
-        for name in ("train_test_chunk_overlap", "validation_test_chunk_overlap"):
-            if audit.get(name) != 0:
-                raise ValueError(f"Prediction evaluation-audit {name} is not zero")
     else:
         if checkpoint is not None or selection is not None or audit is not None:
             raise ValueError(
@@ -676,6 +582,115 @@ def _validate_prediction_run(
         }:
             raise ValueError("Persistence prediction has invalid partition metadata")
     return run
+
+
+def _authenticate_learned_prediction_run(
+    run: Mapping[str, Any],
+    *,
+    protocol: FrozenProtocol,
+    manifest_path: Path,
+    evaluation_manifest: Mapping[str, Any],
+    test_rows: Sequence[dict[str, Any]],
+) -> None:
+    """Revalidate one uniform learned run against its authoritative records."""
+
+    binding = run["evaluation_binding"]
+    checkpoint_record = binding["checkpoint"]
+    selection_record = binding["checkpoint_selection"]
+    audit_record = binding["evaluation_audit"]
+    if not all(
+        isinstance(record, dict)
+        for record in (binding, checkpoint_record, selection_record, audit_record)
+    ):
+        raise ValueError("Learned prediction binding is incomplete")
+
+    bound_paths: dict[str, Path] = {}
+    for name, record in (
+        ("checkpoint selection", selection_record),
+        ("evaluation audit", audit_record),
+    ):
+        path = Path(str(record.get("path", ""))).expanduser().resolve()
+        expected_sha256 = record.get("sha256")
+        if not path.is_file():
+            raise ValueError(f"Prediction {name} does not exist: {path}")
+        if not _valid_sha256(expected_sha256) or sha256_file(path) != expected_sha256:
+            raise ValueError(f"Prediction {name} SHA-256 does not match")
+        bound_paths[name] = path
+
+    checkpoint_path = Path(str(checkpoint_record["path"])).expanduser().resolve()
+    if not checkpoint_path.is_file():
+        raise ValueError(
+            f"Learned prediction checkpoint does not exist: {checkpoint_path}"
+        )
+    checkpoint_sha256 = sha256_file(checkpoint_path)
+    if checkpoint_sha256 != checkpoint_record["sha256"]:
+        raise ValueError("Learned prediction checkpoint SHA-256 does not match")
+    try:
+        checkpoint = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=False
+        )
+    except Exception as error:
+        raise ValueError(
+            f"Learned prediction checkpoint cannot be loaded: {checkpoint_path}"
+        ) from error
+    if not isinstance(checkpoint, dict):
+        raise ValueError("Learned prediction checkpoint payload must be a dictionary")
+    if sha256_file(checkpoint_path) != checkpoint_sha256:
+        raise ValueError("Learned prediction checkpoint changed while it was loaded")
+    if checkpoint.get("checkpoint_schema_version") != CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError("Learned prediction checkpoint has an unsupported schema")
+
+    evaluation_provenance = {
+        "artifact_count": int(evaluation_manifest["clips"]),
+        "chunk_ids": sorted({str(row["chunk_id"]) for row in test_rows}),
+        "dataset_fingerprint": str(evaluation_manifest["dataset_fingerprint"]),
+    }
+    authenticated = validate_learned_test_binding(
+        protocol=protocol.path,
+        selection_record=bound_paths["checkpoint selection"],
+        evaluation_audit=bound_paths["evaluation audit"],
+        checkpoint_path=checkpoint_path,
+        checkpoint_sha256=checkpoint_sha256,
+        checkpoint=checkpoint,
+        manifest_path=manifest_path,
+        manifest_sha256=str(evaluation_manifest["sha256"]),
+        evaluation_provenance=evaluation_provenance,
+    )
+    try:
+        provenance = checkpoint["data_provenance"]
+        signature = checkpoint["resume_signature"]
+        expected_checkpoint_record = {
+            "path": str(checkpoint_path),
+            "sha256": checkpoint_sha256,
+            "epoch": int(checkpoint["epoch"]),
+            "seed": int(checkpoint["seed"]),
+            "train_manifest_sha256": signature["train_manifest_sha256"],
+            "validation_manifest_sha256": signature["val_manifest_sha256"],
+            "train_dataset_fingerprint": provenance["train"][
+                "dataset_fingerprint"
+            ],
+            "validation_dataset_fingerprint": provenance["val"][
+                "dataset_fingerprint"
+            ],
+        }
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            "Learned prediction checkpoint has incomplete evaluation provenance"
+        ) from error
+    expected_binding = {
+        "evaluation_manifest": dict(evaluation_manifest),
+        "checkpoint": expected_checkpoint_record,
+        **authenticated,
+        "partition_isolation": {
+            "train_evaluation_chunk_overlap": 0,
+            "validation_evaluation_chunk_overlap": 0,
+        },
+    }
+    expected_binding["binding_fingerprint"] = canonical_fingerprint(expected_binding)
+    if binding != expected_binding:
+        raise ValueError(
+            "Learned prediction binding does not match authoritative validation"
+        )
 
 
 def _reject_split_leakage(
@@ -1767,6 +1782,13 @@ def evaluate_selection(
         method: _require_uniform(values, f"{method} prediction-run metadata")
         for method, values in prediction_runs.items()
     }
+    _authenticate_learned_prediction_run(
+        uniform_prediction_runs["learned"],
+        protocol=frozen_protocol,
+        manifest_path=test_path,
+        evaluation_manifest=expected_evaluation_manifest,
+        test_rows=test_rows,
+    )
     uniform_policy = _require_uniform(
         selection_policies["learned"] + selection_policies["persistence"],
         "selection policies",

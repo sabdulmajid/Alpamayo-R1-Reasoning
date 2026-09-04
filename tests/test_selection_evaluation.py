@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 import numpy as np
+import torch
 
 from src.world_model.evaluate_selection import (
     cluster_bootstrap_interval,
@@ -96,6 +97,15 @@ class SelectionFixture:
             "train": self.train_manifest,
             "val": self.validation_manifest,
         }
+        self.training_configuration = {
+            "epochs": 4,
+            "batch_size": 4,
+            "workers": 0,
+            "base_channels": 16,
+            "automatic_mixed_precision": False,
+            "learning_rate": 3e-4,
+            "weight_decay": 1e-4,
+        }
         protocol_payload = {
             "schema_version": 1,
             "status": "frozen_before_test_evaluation",
@@ -111,12 +121,29 @@ class SelectionFixture:
                         "sha256": sha256_file(split_paths[name]),
                         "clips": len(rows),
                         "chunks": len({str(row["chunk_id"]) for row in rows}),
-                        "dataset_fingerprint": canonical_fingerprint(rows),
+                        "dataset_fingerprint": canonical_fingerprint(
+                            [
+                                {
+                                    "artifact_sha256": row["artifact_sha256"],
+                                    "chunk_id": str(row["chunk_id"]),
+                                    "clip_id": str(row["clip_id"]),
+                                    "t0_us": int(row["t0_us"]),
+                                }
+                                for row in rows
+                            ]
+                            if name == "test"
+                            else rows
+                        ),
                     }
                     for name, rows in split_rows.items()
                 },
             },
-            "training": {},
+            "training": {
+                "seeds": [17, 18],
+                **self.training_configuration,
+                "checkpoint_selection": "minimum_best_validation_loss",
+                "test_metrics_used_for_selection": False,
+            },
             "forecast_evaluation": {},
             "trajectory_selection": {
                 "primary_outcome": "collision_exposure",
@@ -329,31 +356,174 @@ class SelectionFixture:
         self.oracle_rows.append(dict(oracle_row))
 
     def _write_predictions_and_selections(self, protocol_payload: dict) -> None:
-        checkpoint_sha256 = "c" * 64
-        selection_record = {
+        protocol_provenance = {
+            "path": str(self.protocol.resolve()),
+            "sha256": sha256_file(self.protocol),
+            "protocol_fingerprint": protocol_payload["protocol_fingerprint"],
+        }
+        data_schema = {
+            "input_shape": [2, 6, 6],
+            "target_shape": [2, 6, 6],
+            "past_horizons_s": [-1.0, 0.0],
+            "horizons_s": [1.0, 2.0],
+            "grid_origin_xy_m": [-2.0, -3.0],
+            "resolution_m": 1.0,
+            "coordinate_frame": "ego_at_t0",
+        }
+        model_config = {"base_channels": 16}
+        train_fingerprint = protocol_payload["split"]["manifests"]["train"][
+            "dataset_fingerprint"
+        ]
+        validation_fingerprint = protocol_payload["split"]["manifests"]["val"][
+            "dataset_fingerprint"
+        ]
+        comparison_signature = {
+            "protocol": protocol_provenance,
+            "train_manifest_sha256": sha256_file(self.train_manifest),
+            "val_manifest_sha256": sha256_file(self.validation_manifest),
+            "batch_size": self.training_configuration["batch_size"],
+            "base_channels": self.training_configuration["base_channels"],
+            "amp": self.training_configuration["automatic_mixed_precision"],
+            "learning_rate": self.training_configuration["learning_rate"],
+            "weight_decay": self.training_configuration["weight_decay"],
+        }
+
+        def write_checkpoint(path: Path, *, seed: int, loss: float) -> tuple[dict, str]:
+            checkpoint = {
+                "checkpoint_schema_version": 2,
+                "epoch": 3,
+                "seed": seed,
+                "best_val_loss": loss,
+                "model_config": model_config,
+                "data_schema": data_schema,
+                "resume_signature": {**comparison_signature, "seed": seed},
+                "run_config": {
+                    "epochs": self.training_configuration["epochs"],
+                    "batch_size": self.training_configuration["batch_size"],
+                    "workers": self.training_configuration["workers"],
+                    "base_channels": self.training_configuration["base_channels"],
+                    "amp": self.training_configuration[
+                        "automatic_mixed_precision"
+                    ],
+                    "learning_rate": self.training_configuration["learning_rate"],
+                    "weight_decay": self.training_configuration["weight_decay"],
+                },
+                "data_provenance": {
+                    "train": {
+                        "dataset_fingerprint": train_fingerprint,
+                        "chunk_ids": ["chunk-train"],
+                    },
+                    "val": {
+                        "dataset_fingerprint": validation_fingerprint,
+                        "chunk_ids": ["chunk-validation"],
+                    },
+                },
+            }
+            torch.save(checkpoint, path)
+            return checkpoint, sha256_file(path)
+
+        self.checkpoint_path = (self.root / "best.pt").resolve()
+        self.checkpoint, checkpoint_sha256 = write_checkpoint(
+            self.checkpoint_path, seed=17, loss=0.25
+        )
+        other_checkpoint_path = (self.root / "other.pt").resolve()
+        _, other_checkpoint_sha256 = write_checkpoint(
+            other_checkpoint_path, seed=18, loss=0.5
+        )
+
+        def selection_run(
+            *, label: str, seed: int, loss: float, checkpoint: Path, digest: str
+        ) -> dict:
+            run = {
+                "label": label,
+                "checkpoint": str(checkpoint),
+                "checkpoint_sha256": digest,
+                "epoch": 3,
+                "seed": seed,
+                "best_validation_loss": loss,
+                "train_manifest_sha256": sha256_file(self.train_manifest),
+                "validation_manifest_sha256": sha256_file(
+                    self.validation_manifest
+                ),
+                "train_dataset_fingerprint": train_fingerprint,
+                "validation_dataset_fingerprint": validation_fingerprint,
+                "model_config": model_config,
+                "data_schema": data_schema,
+                "training_configuration": self.training_configuration,
+                "protocol": protocol_provenance,
+                "comparison_signature": comparison_signature,
+            }
+            latest_path = (self.root / f"{label}-latest.pt").resolve()
+            latest_path.write_bytes(f"latest checkpoint for {label}".encode())
+            completion = {
+                "schema_version": 1,
+                "status": "completed",
+                "seed": seed,
+                "epochs": self.training_configuration["epochs"],
+                "final_epoch": self.training_configuration["epochs"] - 1,
+                "protocol": protocol_provenance,
+                "latest_checkpoint": str(latest_path),
+                "latest_checkpoint_sha256": sha256_file(latest_path),
+                "best_checkpoint": str(checkpoint),
+                "best_checkpoint_sha256": digest,
+            }
+            completion["completion_fingerprint"] = canonical_fingerprint(completion)
+            completion_path = (self.root / f"{label}-completion.json").resolve()
+            completion_path.write_text(
+                json.dumps(completion, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            run["training_completion"] = {
+                "path": str(completion_path),
+                "sha256": sha256_file(completion_path),
+                "completion_fingerprint": completion["completion_fingerprint"],
+                "latest_checkpoint": str(latest_path),
+                "latest_checkpoint_sha256": sha256_file(latest_path),
+            }
+            return run
+
+        selected_run = selection_run(
+            label="seed-17",
+            seed=17,
+            loss=0.25,
+            checkpoint=self.checkpoint_path,
+            digest=checkpoint_sha256,
+        )
+        other_run = selection_run(
+            label="seed-18",
+            seed=18,
+            loss=0.5,
+            checkpoint=other_checkpoint_path,
+            digest=other_checkpoint_sha256,
+        )
+        self.selection_record = {
             "schema_version": 2,
             "selection_policy": "minimum_best_validation_loss",
             "test_metrics_used": False,
+            "protocol": protocol_provenance,
             "selected_label": "seed-17",
             "selected_seed": 17,
             "selected_epoch": 3,
             "selected_validation_loss": 0.25,
-            "selected_checkpoint": str((self.root / "best.pt").resolve()),
+            "selected_checkpoint": str(self.checkpoint_path),
             "selected_checkpoint_sha256": checkpoint_sha256,
-            "runs": [],
+            "runs": [selected_run, other_run],
         }
-        selection_record["selection_fingerprint"] = canonical_fingerprint(
-            selection_record
+        self.selection_record["selection_fingerprint"] = canonical_fingerprint(
+            self.selection_record
         )
-        selection_path = self.root / "checkpoint_selection.json"
-        selection_path.write_text(
-            json.dumps(selection_record, sort_keys=True) + "\n", encoding="utf-8"
+        self.selection_path = (self.root / "checkpoint_selection.json").resolve()
+        self.selection_path.write_text(
+            json.dumps(self.selection_record, sort_keys=True) + "\n",
+            encoding="utf-8",
         )
-        audit_record = {
-            "selection": str(selection_path.resolve()),
-            "selection_sha256": sha256_file(selection_path),
-            "selection_fingerprint": selection_record["selection_fingerprint"],
-            "checkpoint": str((self.root / "best.pt").resolve()),
+        self.audit_record = {
+            "selection": str(self.selection_path),
+            "selection_sha256": sha256_file(self.selection_path),
+            "selection_fingerprint": self.selection_record[
+                "selection_fingerprint"
+            ],
+            "protocol": protocol_provenance,
+            "checkpoint": str(self.checkpoint_path),
             "checkpoint_sha256": checkpoint_sha256,
             "test_manifest": str(self.test_manifest.resolve()),
             "test_manifest_sha256": sha256_file(self.test_manifest),
@@ -362,9 +532,9 @@ class SelectionFixture:
             "train_test_chunk_overlap": 0,
             "validation_test_chunk_overlap": 0,
         }
-        audit_path = self.root / "evaluation_partition.json"
-        audit_path.write_text(
-            json.dumps(audit_record, sort_keys=True) + "\n", encoding="utf-8"
+        self.audit_path = (self.root / "evaluation_partition.json").resolve()
+        self.audit_path.write_text(
+            json.dumps(self.audit_record, sort_keys=True) + "\n", encoding="utf-8"
         )
         entries = [
             {
@@ -385,36 +555,28 @@ class SelectionFixture:
             "clips": len(self.test_rows),
             "chunks": len({row["chunk_id"] for row in self.test_rows}),
         }
-        protocol_provenance = {
-            "path": str(self.protocol.resolve()),
-            "sha256": sha256_file(self.protocol),
-            "protocol_fingerprint": protocol_payload["protocol_fingerprint"],
-        }
         selection_binding = {
-            "path": str(selection_path.resolve()),
-            "sha256": sha256_file(selection_path),
-            "selection_fingerprint": selection_record["selection_fingerprint"],
-            "selected_label": selection_record["selected_label"],
-            "selected_seed": selection_record["selected_seed"],
-            "selected_epoch": selection_record["selected_epoch"],
-            "selected_validation_loss": selection_record["selected_validation_loss"],
+            "path": str(self.selection_path),
+            "sha256": sha256_file(self.selection_path),
+            "selection_fingerprint": self.selection_record[
+                "selection_fingerprint"
+            ],
+            "selected_label": self.selection_record["selected_label"],
+            "selected_seed": self.selection_record["selected_seed"],
+            "selected_epoch": self.selection_record["selected_epoch"],
+            "selected_validation_loss": self.selection_record[
+                "selected_validation_loss"
+            ],
         }
         audit_binding = {
-            "path": str(audit_path.resolve()),
-            "sha256": sha256_file(audit_path),
-            "record_fingerprint": canonical_fingerprint(audit_record),
-            "selection_fingerprint": selection_record["selection_fingerprint"],
+            "path": str(self.audit_path),
+            "sha256": sha256_file(self.audit_path),
+            "record_fingerprint": canonical_fingerprint(self.audit_record),
+            "selection_fingerprint": self.selection_record[
+                "selection_fingerprint"
+            ],
             "train_test_chunk_overlap": 0,
             "validation_test_chunk_overlap": 0,
-        }
-        data_schema = {
-            "input_shape": [2, 6, 6],
-            "target_shape": [2, 6, 6],
-            "past_horizons_s": [-1.0, 0.0],
-            "horizons_s": [1.0, 2.0],
-            "grid_origin_xy_m": [-2.0, -3.0],
-            "resolution_m": 1.0,
-            "coordinate_frame": "ego_at_t0",
         }
         weights = RerankWeights()
         learned_probability = np.zeros((2, 6, 6), dtype=np.float32)
@@ -437,14 +599,18 @@ class SelectionFixture:
                     "evaluation_manifest": evaluation_manifest,
                     "checkpoint": (
                         {
-                            "path": str((self.root / "best.pt").resolve()),
+                            "path": str(self.checkpoint_path),
                             "sha256": checkpoint,
                             "epoch": 3,
                             "seed": 17,
-                            "train_manifest_sha256": "1" * 64,
-                            "validation_manifest_sha256": "2" * 64,
-                            "train_dataset_fingerprint": "3" * 64,
-                            "validation_dataset_fingerprint": "4" * 64,
+                            "train_manifest_sha256": sha256_file(
+                                self.train_manifest
+                            ),
+                            "validation_manifest_sha256": sha256_file(
+                                self.validation_manifest
+                            ),
+                            "train_dataset_fingerprint": train_fingerprint,
+                            "validation_dataset_fingerprint": validation_fingerprint,
                         }
                         if learned
                         else None
@@ -516,6 +682,30 @@ class SelectionFixture:
     ) -> None:
         rows = self.rerank_rows if method == "learned" else self.persistence_rows
         row = rows[0]
+        self._mutate_prediction_row(row, mutate)
+        destination = (
+            self.learned_selections
+            if method == "learned"
+            else self.persistence_selections
+        )
+        _write_jsonl(destination, rows)
+
+    def mutate_all_prediction_runs(
+        self, method: str, mutate: Callable[[dict], None]
+    ) -> None:
+        rows = self.rerank_rows if method == "learned" else self.persistence_rows
+        for row in rows:
+            self._mutate_prediction_row(row, mutate)
+        destination = (
+            self.learned_selections
+            if method == "learned"
+            else self.persistence_selections
+        )
+        _write_jsonl(destination, rows)
+
+    def _mutate_prediction_row(
+        self, row: dict, mutate: Callable[[dict], None]
+    ) -> None:
         prediction_path = Path(row["prediction_path"])
         with np.load(prediction_path, allow_pickle=False) as archive:
             arrays = {name: np.asarray(archive[name]) for name in archive.files}
@@ -539,12 +729,53 @@ class SelectionFixture:
         np.savez_compressed(prediction_path, **arrays)
         row["prediction_run_fingerprint"] = run_fingerprint
         row["prediction_sha256"] = sha256_file(prediction_path)
-        destination = (
-            self.learned_selections
-            if method == "learned"
-            else self.persistence_selections
+
+    def rewrite_selection_binding(self) -> None:
+        self.selection_record.pop("selection_fingerprint", None)
+        self.selection_record["selection_fingerprint"] = canonical_fingerprint(
+            self.selection_record
         )
-        _write_jsonl(destination, rows)
+        self.selection_path.write_text(
+            json.dumps(self.selection_record, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.audit_record["selection_sha256"] = sha256_file(self.selection_path)
+        self.audit_record["selection_fingerprint"] = self.selection_record[
+            "selection_fingerprint"
+        ]
+        self.audit_path.write_text(
+            json.dumps(self.audit_record, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        def rebind(run: dict) -> None:
+            binding = run["evaluation_binding"]
+            selection = binding["checkpoint_selection"]
+            selection.update(
+                {
+                    "sha256": sha256_file(self.selection_path),
+                    "selection_fingerprint": self.selection_record[
+                        "selection_fingerprint"
+                    ],
+                    "selected_label": self.selection_record["selected_label"],
+                    "selected_seed": self.selection_record["selected_seed"],
+                    "selected_epoch": self.selection_record["selected_epoch"],
+                    "selected_validation_loss": self.selection_record[
+                        "selected_validation_loss"
+                    ],
+                }
+            )
+            audit = binding["evaluation_audit"]
+            audit.update(
+                {
+                    "sha256": sha256_file(self.audit_path),
+                    "record_fingerprint": canonical_fingerprint(self.audit_record),
+                    "selection_fingerprint": self.selection_record[
+                        "selection_fingerprint"
+                    ],
+                }
+            )
+
+        self.mutate_all_prediction_runs("learned", rebind)
 
     def evaluate(self) -> tuple[dict, list[dict]]:
         return evaluate_selection(
@@ -579,6 +810,15 @@ class ClusterBootstrapTest(unittest.TestCase):
 
 
 class HeldOutSelectionEvaluationTest(unittest.TestCase):
+    def test_authenticates_uniform_learned_run_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SelectionFixture(Path(temporary))
+            with mock.patch(
+                "src.world_model.evaluate_selection.torch.load", wraps=torch.load
+            ) as load_checkpoint:
+                fixture.evaluate()
+        load_checkpoint.assert_called_once()
+
     def test_evaluation_joins_artifacts_and_reports_paired_intervals(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = SelectionFixture(Path(temporary))
@@ -842,6 +1082,50 @@ class HeldOutSelectionEvaluationTest(unittest.TestCase):
                 fixture.mutate_prediction_run(method, mutate)
                 with self.assertRaisesRegex(ValueError, expected_error):
                     fixture.evaluate()
+
+    def test_learned_prediction_requires_protocol_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SelectionFixture(Path(temporary))
+            fixture.mutate_all_prediction_runs(
+                "learned",
+                lambda run: run["evaluation_binding"].pop("protocol"),
+            )
+            with self.assertRaisesRegex(ValueError, "no protocol provenance"):
+                fixture.evaluate()
+
+    def test_learned_prediction_rejects_legacy_selection_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SelectionFixture(Path(temporary))
+            fixture.selection_record["schema_version"] = 1
+            fixture.rewrite_selection_binding()
+            with self.assertRaisesRegex(ValueError, "unsupported schema"):
+                fixture.evaluate()
+
+    def test_learned_prediction_rejects_empty_selection_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SelectionFixture(Path(temporary))
+            fixture.selection_record["runs"] = []
+            fixture.rewrite_selection_binding()
+            with self.assertRaisesRegex(ValueError, "at least two"):
+                fixture.evaluate()
+
+    def test_learned_prediction_rejects_nonwinning_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SelectionFixture(Path(temporary))
+            selected, competitor = fixture.selection_record["runs"]
+            competitor["best_validation_loss"] = 0.1
+            fixture.selection_record["runs"] = [competitor, selected]
+            fixture.rewrite_selection_binding()
+            with self.assertRaisesRegex(ValueError, "minimum validation-loss"):
+                fixture.evaluate()
+
+    def test_learned_prediction_requires_training_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SelectionFixture(Path(temporary))
+            fixture.selection_record["runs"][1].pop("training_completion")
+            fixture.rewrite_selection_binding()
+            with self.assertRaisesRegex(ValueError, "no training completion"):
+                fixture.evaluate()
 
     def test_prediction_run_json_and_fingerprint_are_required(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
