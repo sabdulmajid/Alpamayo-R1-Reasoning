@@ -1454,7 +1454,12 @@ def validate_existing_output(
         )
         if (
             not np.array_equal(candidate_xyz, source_candidate_xyz)
-            or not np.array_equal(candidate_yaw, source_candidate_yaw)
+            or not np.allclose(
+                candidate_yaw,
+                source_candidate_yaw,
+                rtol=0.0,
+                atol=1e-7,
+            )
             or not np.array_equal(candidate_times, source_candidate_times)
             or str(scalar("candidate_yaw_source")) != source_yaw_source
         ):

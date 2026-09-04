@@ -414,6 +414,24 @@ class SerializationTests(unittest.TestCase):
                 candidate_ref,
             )
             self.assertTrue(resumed["resumed"])
+
+            rounded = dict(arrays)
+            rounded["candidate_yaw"] = rounded["candidate_yaw"].copy()
+            rounded["candidate_yaw"][0, 0] = np.nextafter(
+                rounded["candidate_yaw"][0, 0], np.float32(np.inf)
+            )
+            atomic_save_npz(path, rounded)
+            self.assertTrue(
+                validate_existing_output(
+                    path,
+                    "clip",
+                    1_000_000,
+                    "revision",
+                    oracle_config,
+                    candidate_ref,
+                )["resumed"]
+            )
+
             changed = dict(oracle_config)
             changed["history_offsets_s"] = [-0.5, 0.0]
             with self.assertRaisesRegex(ValueError, "configuration"):
