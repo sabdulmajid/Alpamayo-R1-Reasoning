@@ -19,7 +19,7 @@ class _HorizonState:
 
 
 class OccupancyMetricAccumulator:
-    """Accumulate threshold metrics, Brier score, and histogram AUPRC."""
+    """Accumulate threshold metrics, Brier score, and histogram average precision."""
 
     def __init__(self, num_horizons: int, threshold: float = 0.5, bins: int = 1000) -> None:
         if bins < 2:
@@ -69,7 +69,7 @@ class OccupancyMetricAccumulator:
             union = tp + fp + fn
             precision = tp / (tp + fp) if tp + fp else None
             recall = tp / (tp + fn) if tp + fn else None
-            auprc = self._auprc(index)
+            average_precision = self._average_precision(index)
             results.append(
                 {
                     "horizon_s": float(horizons_s[index]) if horizons_s is not None else index,
@@ -77,18 +77,18 @@ class OccupancyMetricAccumulator:
                     "iou": tp / union if union else None,
                     "precision": precision,
                     "recall": recall,
-                    "auprc": auprc,
+                    "average_precision": average_precision,
                     "brier": state.brier_sum / state.count if state.count else None,
                 }
             )
         valid = [result for result in results if result["valid_cells"]]
         mean_metrics: dict[str, float | None] = {}
-        for name in ("iou", "precision", "recall", "auprc", "brier"):
+        for name in ("iou", "precision", "recall", "average_precision", "brier"):
             values = [float(result[name]) for result in valid if result[name] is not None]
             mean_metrics[name] = float(np.mean(values)) if values else None
         return {"per_horizon": results, "mean": mean_metrics, "threshold": self.threshold}
 
-    def _auprc(self, horizon: int) -> float | None:
+    def _average_precision(self, horizon: int) -> float | None:
         positives = self.positive_hist[horizon][::-1].cumsum().astype(np.float64)
         negatives = self.negative_hist[horizon][::-1].cumsum().astype(np.float64)
         total_positives = positives[-1]
@@ -96,9 +96,5 @@ class OccupancyMetricAccumulator:
             return None
         recall = positives / total_positives
         precision = positives / np.maximum(positives + negatives, 1.0)
-        recall = np.concatenate(([0.0], recall))
-        precision = np.concatenate(([1.0], precision))
-        trapezoid = getattr(np, "trapezoid", None)
-        if trapezoid is None:  # NumPy < 2.0
-            trapezoid = np.trapz
-        return float(trapezoid(precision, recall))
+        recall_step = np.diff(np.concatenate(([0.0], recall)))
+        return float(np.sum(recall_step * precision))

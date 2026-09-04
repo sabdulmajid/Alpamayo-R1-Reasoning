@@ -1,6 +1,8 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -9,10 +11,12 @@ from src.lidar_world_oracle import (
     BEVConfig,
     CandidateArtifactRef,
     ClipOracleResult,
+    REFERENCE_TIMESTAMP_MODE,
     PointFilterConfig,
     VehicleDimensions,
     atomic_save_npz,
     config_fingerprint,
+    decode_lidar_spin,
     evaluate_candidate_risks,
     file_sha256,
     filter_ego_returns,
@@ -133,6 +137,35 @@ class RasterTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "No LiDAR spin"):
             select_spin_rows(frame, t0_us=0, horizons_s=[1.4], tolerance_s=0.1)
+
+    def test_reference_timestamp_schema_uses_rigid_spin_pose(self):
+        frame = pd.DataFrame(
+            {
+                "reference_timestamp": [900_000, 1_900_000, 2_900_000],
+                "draco_encoded_pointcloud": [b"first", b"second", b"third"],
+            }
+        )
+        selected = select_spin_rows(
+            frame,
+            t0_us=0,
+            horizons_s=[1.0, 3.0],
+            tolerance_s=0.11,
+            timestamp_mode=REFERENCE_TIMESTAMP_MODE,
+        )
+        self.assertEqual(
+            [int(row.reference_timestamp) for row in selected],
+            [900_000, 2_900_000],
+        )
+        cloud = SimpleNamespace(
+            points=np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+            attributes=[],
+        )
+        with mock.patch("DracoPy.decode", return_value=cloud):
+            spin = decode_lidar_spin(
+                selected[0], timestamp_mode=REFERENCE_TIMESTAMP_MODE
+            )
+        np.testing.assert_array_equal(spin.point_timestamps_us, [900_000, 900_000])
+        self.assertEqual(spin.midpoint_timestamp_us, 900_000)
 
 
 class CollisionTests(unittest.TestCase):
@@ -381,6 +414,44 @@ class SerializationTests(unittest.TestCase):
                 candidate_ref,
             )
             self.assertTrue(resumed["resumed"])
+
+            for yaw_delta, accepted in ((5e-7, True), (2e-6, False)):
+                source_yaw = candidate_yaw.copy()
+                source_yaw[0, 0] += np.float32(yaw_delta)
+                source_geometry = (
+                    candidate_xyz,
+                    source_yaw,
+                    candidate_times,
+                    "pred_yaw",
+                )
+                with mock.patch(
+                    "src.lidar_world_oracle.load_candidate_geometry",
+                    return_value=source_geometry,
+                ):
+                    if accepted:
+                        self.assertTrue(
+                            validate_existing_output(
+                                path,
+                                "clip",
+                                1_000_000,
+                                "revision",
+                                oracle_config,
+                                candidate_ref,
+                            )["resumed"]
+                        )
+                    else:
+                        with self.assertRaisesRegex(
+                            ValueError, "candidate geometry"
+                        ):
+                            validate_existing_output(
+                                path,
+                                "clip",
+                                1_000_000,
+                                "revision",
+                                oracle_config,
+                                candidate_ref,
+                            )
+
             changed = dict(oracle_config)
             changed["history_offsets_s"] = [-0.5, 0.0]
             with self.assertRaisesRegex(ValueError, "configuration"):

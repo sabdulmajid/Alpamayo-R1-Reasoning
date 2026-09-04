@@ -3,10 +3,10 @@
 #SBATCH --partition=dualcard
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=24G
-#SBATCH --time=06:00:00
-#SBATCH --array=0-7%2
+#SBATCH --cpus-per-task=3
+#SBATCH --mem=7G
+#SBATCH --time=20:00:00
+#SBATCH --array=0-7%8
 #SBATCH --output=slurm-%x-%A_%a.out
 #SBATCH --error=slurm-%x-%A_%a.err
 

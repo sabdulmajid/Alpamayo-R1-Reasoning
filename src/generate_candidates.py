@@ -29,6 +29,11 @@ import numpy as np
 import pandas as pd
 import torch
 
+if __package__:
+    from .revision_pinned_dataset import pin_streaming_revision
+else:
+    from revision_pinned_dataset import pin_streaming_revision
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATASET_REVISION = "2ae73f49ffd2b5db43b404201beb7b92889f7afc"
@@ -43,6 +48,7 @@ class GenerationConfig:
     model_id: str = "nvidia/Alpamayo-R1-10B"
     model_revision: str = DEFAULT_MODEL_REVISION
     dataset_revision: str = DEFAULT_DATASET_REVISION
+    dataset_access_mode: str = "revision-qualified-streaming"
     num_candidates: int = 6
     samples_per_rollout: int = 1
     max_generation_length: int = 256
@@ -66,6 +72,8 @@ class GenerationConfig:
             raise ValueError("top_p must be in (0, 1]")
         if self.temperature <= 0.0:
             raise ValueError("temperature must be positive")
+        if self.dataset_access_mode != "revision-qualified-streaming":
+            raise ValueError("dataset_access_mode must bind streamed files to the revision")
 
     @property
     def fingerprint(self) -> str:
@@ -863,8 +871,11 @@ def run_generation(args: argparse.Namespace) -> int:
             )
         import physical_ai_av
 
-        avdi = physical_ai_av.PhysicalAIAVDatasetInterface(
-            revision=config.dataset_revision
+        avdi = pin_streaming_revision(
+            physical_ai_av.PhysicalAIAVDatasetInterface(
+                revision=config.dataset_revision
+            ),
+            config.dataset_revision,
         )
         generator = AlpamayoCandidateGenerator(config, args.gpu_memory, args.cpu_memory)
         generator.load()

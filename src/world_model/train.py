@@ -15,8 +15,15 @@ from .data import OccupancyDataset, dataset_provenance, reject_chunk_overlap
 from .losses import occupancy_loss
 from .metrics import OccupancyMetricAccumulator
 from .model import ModelConfig, TemporalOccupancyNet
+from .protocol import (
+    load_frozen_protocol,
+    normalize_training_configuration,
+    validate_manifest_binding,
+    validate_training_run_configuration,
+)
 from .runtime import (
     atomic_torch_save,
+    canonical_fingerprint,
     capture_rng_state,
     restore_rng_state,
     seed_everything,
@@ -118,6 +125,7 @@ def run_epoch(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--protocol", required=True)
     parser.add_argument("--train-manifest", required=True)
     parser.add_argument("--val-manifest", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -160,6 +168,37 @@ def main() -> None:
         right_name="validation data",
     )
     data_provenance = {"train": train_provenance, "val": val_provenance}
+    frozen_protocol = load_frozen_protocol(args.protocol)
+    for name, manifest, provenance in (
+        ("train", args.train_manifest, train_provenance),
+        ("val", args.val_manifest, val_provenance),
+    ):
+        validate_manifest_binding(
+            frozen_protocol,
+            name,
+            manifest,
+            actual_sha256=sha256_file(manifest),
+            clips=int(provenance["artifact_count"]),
+            chunks=len(provenance["chunk_ids"]),
+            dataset_fingerprint=str(provenance["dataset_fingerprint"]),
+        )
+    training_configuration = normalize_training_configuration(
+        {
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "workers": args.workers,
+            "base_channels": args.base_channels,
+            "automatic_mixed_precision": args.amp,
+            "learning_rate": args.learning_rate,
+            "weight_decay": args.weight_decay,
+        },
+        label="Requested training configuration",
+    )
+    validate_training_run_configuration(
+        frozen_protocol,
+        seed=args.seed,
+        configuration=training_configuration,
+    )
     example = train_dataset[0]
     val_example = val_dataset[0]
     if (
@@ -196,6 +235,7 @@ def main() -> None:
     )
 
     resume_signature = {
+        "protocol": frozen_protocol.provenance(),
         "train_manifest": str(Path(args.train_manifest).resolve()),
         "train_manifest_sha256": sha256_file(args.train_manifest),
         "train_dataset_fingerprint": train_provenance["dataset_fingerprint"],
@@ -316,6 +356,30 @@ def main() -> None:
             f"epoch={epoch} train_loss={train_losses['loss']:.5f} "
             f"val_loss={val_losses['loss']:.5f} best={best_val:.5f}"
         )
+
+    completed_epochs = [int(record["epoch"]) for record in history]
+    if completed_epochs != list(range(args.epochs)):
+        raise ValueError(
+            "Training history does not prove completion of every protocol epoch"
+        )
+    latest_path = (output_dir / "latest.pt").resolve()
+    best_path = (output_dir / "best.pt").resolve()
+    if not latest_path.is_file() or not best_path.is_file():
+        raise FileNotFoundError("Completed training has no latest or best checkpoint")
+    completion = {
+        "schema_version": 1,
+        "status": "completed",
+        "seed": args.seed,
+        "epochs": args.epochs,
+        "final_epoch": args.epochs - 1,
+        "protocol": frozen_protocol.provenance(),
+        "latest_checkpoint": str(latest_path),
+        "latest_checkpoint_sha256": sha256_file(latest_path),
+        "best_checkpoint": str(best_path),
+        "best_checkpoint_sha256": sha256_file(best_path),
+    }
+    completion["completion_fingerprint"] = canonical_fingerprint(completion)
+    write_json(completion, output_dir / "completion.json")
 
 
 if __name__ == "__main__":

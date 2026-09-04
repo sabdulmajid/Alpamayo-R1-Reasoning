@@ -27,9 +27,17 @@ import pandas as pd
 from scipy.ndimage import distance_transform_edt
 from scipy.spatial.transform import Rotation
 
+if __package__:
+    from .revision_pinned_dataset import pin_streaming_revision
+else:
+    from revision_pinned_dataset import pin_streaming_revision
+
 
 DATASET_REVISION = "2ae73f49ffd2b5db43b404201beb7b92889f7afc"
 LIDAR_FEATURE = "lidar_top_360fov"
+REFERENCE_TIMESTAMP_MODE = "reference-timestamp-rigid-spin"
+PER_POINT_TIMESTAMP_MODE = "spin-interval-per-point"
+DERIVED_YAW_ATOL_RAD = 1e-6
 OUTPUT_SCHEMA_VERSION = 4
 
 
@@ -338,7 +346,22 @@ def rasterize_spin(
     return occupancy, observed, counts
 
 
-def decode_lidar_spin(row: pd.Series) -> DecodedSpin:
+def detect_lidar_timestamp_mode(columns: Iterable[str]) -> str:
+    """Identify the supported LiDAR timestamp schema without guessing."""
+
+    names = set(columns)
+    if {"spin_start_timestamp", "spin_end_timestamp"} <= names:
+        return PER_POINT_TIMESTAMP_MODE
+    if "reference_timestamp" in names:
+        return REFERENCE_TIMESTAMP_MODE
+    raise ValueError(
+        "LiDAR parquet has neither a reference timestamp nor a spin interval"
+    )
+
+
+def decode_lidar_spin(
+    row: pd.Series, timestamp_mode: str | None = None
+) -> DecodedSpin:
     """Decode one PhysicalAI-AV Draco point-cloud row with absolute timestamps."""
 
     try:
@@ -349,16 +372,24 @@ def decode_lidar_spin(row: pd.Series) -> DecodedSpin:
             "requirements-world-oracle.txt"
         ) from exc
 
-    required = {
-        "spin_start_timestamp",
-        "spin_end_timestamp",
-        "draco_encoded_pointcloud",
-    }
+    mode = timestamp_mode or detect_lidar_timestamp_mode(row.index)
+    required = {"draco_encoded_pointcloud"}
+    if mode == PER_POINT_TIMESTAMP_MODE:
+        required.update({"spin_start_timestamp", "spin_end_timestamp"})
+    elif mode == REFERENCE_TIMESTAMP_MODE:
+        required.add("reference_timestamp")
+    else:
+        raise ValueError(f"Unsupported LiDAR timestamp mode: {mode}")
     missing = sorted(required - set(row.index))
     if missing:
         raise ValueError(f"LiDAR row is missing columns: {missing}")
     cloud = DracoPy.decode(row["draco_encoded_pointcloud"])
     points = np.asarray(cloud.points, dtype=np.float64)
+    if mode == REFERENCE_TIMESTAMP_MODE:
+        reference = int(row["reference_timestamp"])
+        timestamps = np.full(len(points), reference, dtype=np.int64)
+        return DecodedSpin(points, timestamps, reference, reference)
+
     attributes = {
         attribute["name"]: attribute["data"] for attribute in cloud.attributes
     }
@@ -381,10 +412,17 @@ def select_spin_rows(
     t0_us: int,
     horizons_s: Sequence[float],
     tolerance_s: float,
+    timestamp_mode: str | None = None,
 ) -> list[pd.Series]:
     """Select the nearest complete spin to each requested future horizon."""
 
-    required = {"spin_start_timestamp", "spin_end_timestamp"}
+    mode = timestamp_mode or detect_lidar_timestamp_mode(lidar_df.columns)
+    if mode == PER_POINT_TIMESTAMP_MODE:
+        required = {"spin_start_timestamp", "spin_end_timestamp"}
+    elif mode == REFERENCE_TIMESTAMP_MODE:
+        required = {"reference_timestamp"}
+    else:
+        raise ValueError(f"Unsupported LiDAR timestamp mode: {mode}")
     missing = sorted(required - set(lidar_df.columns))
     if missing:
         raise ValueError(f"LiDAR parquet is missing columns: {missing}")
@@ -392,10 +430,13 @@ def select_spin_rows(
         raise ValueError("LiDAR parquet contains no spins")
     if tolerance_s <= 0:
         raise ValueError("Spin tolerance must be positive")
-    midpoints = (
-        lidar_df["spin_start_timestamp"].to_numpy(dtype=np.int64)
-        + lidar_df["spin_end_timestamp"].to_numpy(dtype=np.int64)
-    ) // 2
+    if mode == PER_POINT_TIMESTAMP_MODE:
+        midpoints = (
+            lidar_df["spin_start_timestamp"].to_numpy(dtype=np.int64)
+            + lidar_df["spin_end_timestamp"].to_numpy(dtype=np.int64)
+        ) // 2
+    else:
+        midpoints = lidar_df["reference_timestamp"].to_numpy(dtype=np.int64)
     selected: list[pd.Series] = []
     tolerance_us = int(round(tolerance_s * 1_000_000))
     for horizon_s in horizons_s:
@@ -889,10 +930,13 @@ def oracle_config_payload(
     candidate_dt_s: float,
     observed_ray_stride: int,
     footprint_padding_m: float,
+    lidar_timestamp_mode: str = REFERENCE_TIMESTAMP_MODE,
 ) -> dict[str, Any]:
     """Return every parameter that changes an oracle artifact."""
 
     return {
+        "dataset_access_mode": "revision-qualified-streaming",
+        "lidar_timestamp_mode": lidar_timestamp_mode,
         "horizons_s": [float(value) for value in horizons_s],
         "history_offsets_s": [float(value) for value in history_offsets_s],
         "bev": asdict(bev_config),
@@ -922,6 +966,7 @@ def build_clip_oracle(
     candidate_dt_s: float = 0.1,
     observed_ray_stride: int = 16,
     footprint_padding_m: float = 0.0,
+    lidar_timestamp_mode: str = REFERENCE_TIMESTAMP_MODE,
 ) -> ClipOracleResult:
     """Load one clip, replay future LiDAR, and rank its trajectory candidates."""
 
@@ -948,14 +993,27 @@ def build_clip_oracle(
         raise ValueError(
             "PhysicalAI-AV LiDAR feature did not contain a pointclouds DataFrame"
         )
+    detected_timestamp_mode = detect_lidar_timestamp_mode(
+        lidar_data["pointclouds"].columns
+    )
+    if detected_timestamp_mode != lidar_timestamp_mode:
+        raise ValueError(
+            f"LiDAR timestamp mode {detected_timestamp_mode!r} does not match "
+            f"the configured mode {lidar_timestamp_mode!r}"
+        )
     history_rows = select_spin_rows(
         lidar_data["pointclouds"],
         t0_us,
         history_offsets_s,
         tolerance_s=spin_tolerance_s,
+        timestamp_mode=lidar_timestamp_mode,
     )
     future_rows = select_spin_rows(
-        lidar_data["pointclouds"], t0_us, horizons_s, tolerance_s=spin_tolerance_s
+        lidar_data["pointclouds"],
+        t0_us,
+        horizons_s,
+        tolerance_s=spin_tolerance_s,
+        timestamp_mode=lidar_timestamp_mode,
     )
     egomotion = avdi.get_clip_feature(clip_id, "egomotion", maybe_stream=True)
     extrinsics = avdi.get_clip_feature(clip_id, "sensor_extrinsics", maybe_stream=True)
@@ -976,7 +1034,7 @@ def build_clip_oracle(
         count_grids = []
         spin_timestamps = []
         for row in rows:
-            spin = decode_lidar_spin(row)
+            spin = decode_lidar_spin(row, timestamp_mode=lidar_timestamp_mode)
             point_poses = rigid_transform_to_matrices(
                 egomotion(spin.point_timestamps_us).pose
             )
@@ -1397,7 +1455,12 @@ def validate_existing_output(
         )
         if (
             not np.array_equal(candidate_xyz, source_candidate_xyz)
-            or not np.array_equal(candidate_yaw, source_candidate_yaw)
+            or not np.allclose(
+                candidate_yaw,
+                source_candidate_yaw,
+                rtol=0.0,
+                atol=DERIVED_YAW_ATOL_RAD,
+            )
             or not np.array_equal(candidate_times, source_candidate_times)
             or str(scalar("candidate_yaw_source")) != source_yaw_source
         ):
@@ -1630,13 +1693,17 @@ def run_shard(args: argparse.Namespace) -> Path:
         candidate_dt_s=args.candidate_dt,
         observed_ray_stride=args.observed_ray_stride,
         footprint_padding_m=args.footprint_padding,
+        lidar_timestamp_mode=args.lidar_timestamp_mode,
     )
     oracle_fingerprint = config_fingerprint(oracle_config)
     candidate_index = load_candidate_record_index(Path(args.candidate_dir))
-    avdi = physical_ai_av.PhysicalAIAVDatasetInterface(
-        revision=args.dataset_revision,
-        cache_dir=args.cache_dir,
-        confirm_download_threshold_gb=float("inf"),
+    avdi = pin_streaming_revision(
+        physical_ai_av.PhysicalAIAVDatasetInterface(
+            revision=args.dataset_revision,
+            cache_dir=args.cache_dir,
+            confirm_download_threshold_gb=float("inf"),
+        ),
+        args.dataset_revision,
     )
     clips = validate_clip_frame(pd.read_parquet(args.clip_parquet))
     clips["chunk_id"] = [avdi.get_clip_chunk(clip_id) for clip_id in clips["clip_id"]]
@@ -1710,6 +1777,7 @@ def run_shard(args: argparse.Namespace) -> Path:
             candidate_dt_s=args.candidate_dt,
             observed_ray_stride=args.observed_ray_stride,
             footprint_padding_m=args.footprint_padding,
+            lidar_timestamp_mode=args.lidar_timestamp_mode,
         )
         atomic_save_npz(
             output_path,
@@ -1779,6 +1847,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ego-padding", type=float, default=0.5)
     parser.add_argument("--observed-ray-stride", type=int, default=16)
     parser.add_argument("--footprint-padding", type=float, default=0.0)
+    parser.add_argument(
+        "--lidar-timestamp-mode",
+        choices=[REFERENCE_TIMESTAMP_MODE, PER_POINT_TIMESTAMP_MODE],
+        default=REFERENCE_TIMESTAMP_MODE,
+    )
     return parser.parse_args(argv)
 
 

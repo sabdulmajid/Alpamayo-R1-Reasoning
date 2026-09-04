@@ -17,8 +17,8 @@ from src.world_model.data import (
 from src.world_model.losses import occupancy_loss
 from src.world_model.metrics import OccupancyMetricAccumulator
 from src.world_model.model import ModelConfig, TemporalOccupancyNet
-from src.world_model.rerank import RerankWeights, rerank_artifacts
-from src.world_model.runtime import sha256_file
+from src.world_model.rerank import RerankWeights, rerank_artifacts, trajectory_comfort
+from src.world_model.runtime import canonical_fingerprint, sha256_file
 from src.world_model.split_manifest import split_rows
 
 
@@ -188,6 +188,7 @@ class ModelAndMetricTest(unittest.TestCase):
         metrics = accumulator.compute([1.0])
         self.assertEqual(metrics["per_horizon"][0]["valid_cells"], 3)
         self.assertAlmostEqual(metrics["mean"]["iou"], 1.0)
+        self.assertAlmostEqual(metrics["mean"]["average_precision"], 1.0)
         self.assertAlmostEqual(metrics["mean"]["brier"], 0.0)
 
     def test_persistence_baselines_identity(self) -> None:
@@ -204,12 +205,27 @@ class ModelAndMetricTest(unittest.TestCase):
 
 
 class RerankerTest(unittest.TestCase):
+    def test_comfort_includes_origin_before_first_positive_sample(self) -> None:
+        xy = np.array([[1.0, 0.0], [2.0, 0.0]], dtype=np.float32)
+        times = np.array([1.0, 2.0], dtype=np.float32)
+        metrics = trajectory_comfort(xy, times)
+        self.assertAlmostEqual(metrics["mean_speed_mps"], 1.0)
+        self.assertAlmostEqual(metrics["progress_m"], 2.0)
+
     def test_predicted_occupancy_changes_selection_without_oracle_access(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             probability = np.zeros((2, 20, 30), dtype=np.float32)
             probability[:, 9:12, 13:23] = 0.99
             prediction_path = root / "prediction.npz"
+            prediction_run = {
+                "method": "learned",
+                "data_role": "test",
+                "checkpoint_sha256": "b" * 64,
+                "amp": False,
+                "evaluation_binding": {},
+                "data_schema": {},
+            }
             np.savez_compressed(
                 prediction_path,
                 schema_version=np.int16(2),
@@ -223,7 +239,17 @@ class RerankerTest(unittest.TestCase):
                 source_artifact_sha256=np.asarray("a" * 64),
                 producer_method=np.asarray("learned"),
                 checkpoint_sha256=np.asarray("b" * 64),
-                prediction_run_fingerprint=np.asarray("c" * 64),
+                prediction_run_json=np.asarray(
+                    json.dumps(
+                        prediction_run,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                ),
+                prediction_run_fingerprint=np.asarray(
+                    canonical_fingerprint(prediction_run)
+                ),
             )
             times = np.array([0.0, 1.0, 2.0], dtype=np.float32)
             candidate_zero = np.stack(
@@ -273,6 +299,29 @@ class RerankerTest(unittest.TestCase):
             np.savez_compressed(prediction_path, **prediction_arrays)
             repeated = rerank_artifacts(prediction_path, candidate_path, RerankWeights())
             self.assertEqual(repeated["world_selected_index"], 1)
+
+            missing_run = {
+                name: value
+                for name, value in prediction_arrays.items()
+                if name != "prediction_run_json"
+            }
+            np.savez_compressed(prediction_path, **missing_run)
+            with self.assertRaisesRegex(ValueError, "prediction_run_json"):
+                rerank_artifacts(prediction_path, candidate_path, RerankWeights())
+
+            forged_run = dict(prediction_run)
+            forged_run["amp"] = True
+            prediction_arrays["prediction_run_json"] = np.asarray(
+                json.dumps(
+                    forged_run,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            )
+            np.savez_compressed(prediction_path, **prediction_arrays)
+            with self.assertRaisesRegex(ValueError, "fingerprint does not match"):
+                rerank_artifacts(prediction_path, candidate_path, RerankWeights())
 
 
 if __name__ == "__main__":
