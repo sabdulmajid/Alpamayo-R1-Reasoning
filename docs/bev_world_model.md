@@ -1,9 +1,16 @@
 # BEV Occupancy Forecasting and Trajectory Reranking
 
 This engineering extension forecasts future LiDAR occupancy from recorded
-history, then scores Alpamayo trajectory candidates against that forecast. The
-model is intentionally compact enough for one GPU. No trained checkpoint or
-world-model result is committed; the commands below define the experiment.
+history. It then scores Alpamayo trajectory candidates against that forecast.
+The model has 339,910 trainable parameters and fits on one GPU. Training starts
+with random weights. The network does not use a pretrained world-model
+checkpoint.
+
+The repository contains the final machine-readable result and one held-out
+forecast figure. It does not contain the runtime checkpoints or all prediction
+files. Read [`../reports/world_model_benchmark_2k.json`](../reports/world_model_benchmark_2k.json)
+for the final values and artifact hashes. Read the predictive occupancy section
+in [`../README.md`](../README.md) for a plain-language explanation.
 
 ## Input contract
 
@@ -213,7 +220,7 @@ exactly one NVIDIA RTX A4500. The stage exits if this condition is false.
 
 ## Decision gates
 
-Scale beyond a smoke run only if:
+The experiment defined these gates before the final test:
 
 1. 100 oracle artifacts load with no identity, geometry, or schema failure.
 2. Learned IoU and average precision exceed persistence at short horizons and
@@ -224,4 +231,6 @@ Scale beyond a smoke run only if:
 5. Mean ADE degradation is at most 0.2 m, reported with paired bootstrap
    intervals.
 
-These are acceptance thresholds, not results from the current repository.
+The final forecast passed all three forecast gates. The path selector passed 1
+of 5 selection gates. Therefore, the complete benchmark did not pass. The
+machine-readable report contains each measured value and its paired interval.
