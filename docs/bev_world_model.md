@@ -9,8 +9,8 @@ checkpoint.
 The repository contains the final machine-readable result and one held-out
 forecast figure. It does not contain the runtime checkpoints or all prediction
 files. Read [`../reports/world_model_benchmark_2k.json`](../reports/world_model_benchmark_2k.json)
-for the final values and artifact hashes. Read the predictive occupancy section
-in [`../README.md`](../README.md) for a plain-language explanation.
+for the final values and artifact hashes. Read [`../README.md`](../README.md)
+for the project overview and plain-language result summary.
 
 ## Input contract
 
