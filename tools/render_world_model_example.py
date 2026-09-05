@@ -12,13 +12,12 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 
-PANEL_WIDTH = 320
-PANEL_HEIGHT = 400
+PANEL_WIDTH = 360
+PANEL_HEIGHT = 450
 PANEL_GAP = 32
-LEFT_MARGIN = 150
+LEFT_MARGIN = 48
 TOP_MARGIN = 190
-ROW_GAP = 74
-HORIZONS_TO_RENDER = (0.5, 2.0, 6.0)
+DISPLAY_HORIZON = 2.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -190,6 +189,18 @@ def _draw_legend(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
     )
 
 
+def _draw_ego_marker(draw: ImageDraw.ImageDraw, panel_x: int, panel_y: int) -> None:
+    """Mark the vehicle position at planning time on the fixed BEV grid."""
+
+    center_x = panel_x + PANEL_WIDTH // 2
+    center_y = panel_y + round(PANEL_HEIGHT * 0.8)
+    draw.rectangle(
+        (center_x - 6, center_y - 13, center_x + 6, center_y + 13),
+        outline=(56, 189, 248),
+        width=3,
+    )
+
+
 def render(
     row: dict[str, Any],
     learned_path: Path,
@@ -204,61 +215,55 @@ def render(
         np.load(persistence_path, allow_pickle=False) as persistence_archive,
     ):
         horizons = target_archive["horizons_s"].astype(np.float32)
-        indices = [
-            int(np.argmin(np.abs(horizons - value))) for value in HORIZONS_TO_RENDER
-        ]
-        if any(
-            abs(float(horizons[index]) - value) > 1e-4
-            for index, value in zip(indices, HORIZONS_TO_RENDER)
-        ):
-            raise ValueError("The required display horizons are not present")
+        index = int(np.argmin(np.abs(horizons - DISPLAY_HORIZON)))
+        if abs(float(horizons[index]) - DISPLAY_HORIZON) > 1e-4:
+            raise ValueError("The required display horizon is not present")
         target = target_archive["occupancy"]
         observed = target_archive["observed"]
         learned = learned_archive["occupancy_prob"].astype(np.float32)
         persistence = persistence_archive["occupancy_prob"].astype(np.float32)
 
-        rows_data = []
-        for index in indices:
-            rows_data.append(
-                {
-                    "horizon": float(horizons[index]),
-                    "target": target[index],
-                    "observed": observed[index],
-                    "learned": learned[index],
-                    "persistence": persistence[index],
-                    "learned_brier": _masked_brier(
-                        learned[index], target[index], observed[index]
-                    ),
-                    "persistence_brier": _masked_brier(
-                        persistence[index], target[index], observed[index]
-                    ),
-                }
-            )
+        values = {
+            "target": target[index],
+            "observed": observed[index],
+            "learned": learned[index],
+            "persistence": persistence[index],
+            "learned_brier": _masked_brier(
+                learned[index], target[index], observed[index]
+            ),
+            "persistence_brier": _masked_brier(
+                persistence[index], target[index], observed[index]
+            ),
+        }
 
-    canvas_width = LEFT_MARGIN + 3 * PANEL_WIDTH + 2 * PANEL_GAP + 70
-    canvas_height = TOP_MARGIN + 3 * PANEL_HEIGHT + 2 * ROW_GAP + 150
+    canvas_width = 2 * LEFT_MARGIN + 3 * PANEL_WIDTH + 2 * PANEL_GAP
+    canvas_height = 790
     canvas = Image.new("RGB", (canvas_width, canvas_height), color=(8, 11, 16))
     draw = ImageDraw.Draw(canvas)
     draw.text(
         (48, 30),
-        "Held-out occupancy forecast: median test example",
+        "One recorded scene, two seconds ahead",
         font=_font(36, bold=True),
         fill=(244, 247, 250),
     )
     draw.text(
         (48, 82),
-        "Selected before plotting: closest clip to the median 0.5-2.0 s Brier improvement",
+        "A typical held-out clip, selected by median forecast improvement before plotting",
         font=_font(22),
         fill=(177, 185, 196),
     )
     draw.text(
         (48, 118),
-        f"Clip {row['clip_id']}  |  improvement {improvement:.4f}  |  test median {median_improvement:.4f}",
-        font=_font(19),
+        "White is recorded occupancy. Color is forecast probability. Black was not observed.",
+        font=_font(20),
         fill=(132, 199, 255),
     )
 
-    headers = ("Recorded future", "Learned forecast", "Copy-current baseline")
+    headers = (
+        "What LiDAR recorded",
+        "What the model predicted",
+        "Baseline: no movement",
+    )
     for column, header in enumerate(headers):
         x = LEFT_MARGIN + column * (PANEL_WIDTH + PANEL_GAP)
         _draw_centered(
@@ -270,49 +275,42 @@ def render(
             (231, 235, 240),
         )
 
-    for row_index, values in enumerate(rows_data):
-        y = TOP_MARGIN + row_index * (PANEL_HEIGHT + ROW_GAP)
-        draw.text(
-            (34, y + PANEL_HEIGHT // 2 - 30),
-            f"{values['horizon']:g} s",
-            font=_font(28, bold=True),
-            fill=(244, 247, 250),
+    panels = (
+        _panel(_target_colors(values["target"], values["observed"])),
+        _panel(_probability_colors(values["learned"], values["observed"])),
+        _panel(_probability_colors(values["persistence"], values["observed"])),
+    )
+    for column, panel in enumerate(panels):
+        x = LEFT_MARGIN + column * (PANEL_WIDTH + PANEL_GAP)
+        canvas.paste(panel, (x, TOP_MARGIN))
+        draw.rectangle(
+            (x, TOP_MARGIN, x + PANEL_WIDTH, TOP_MARGIN + PANEL_HEIGHT),
+            outline=(85, 94, 108),
+            width=2,
         )
-        panels = (
-            _panel(_target_colors(values["target"], values["observed"])),
-            _panel(_probability_colors(values["learned"], values["observed"])),
-            _panel(_probability_colors(values["persistence"], values["observed"])),
-        )
-        for column, panel in enumerate(panels):
-            x = LEFT_MARGIN + column * (PANEL_WIDTH + PANEL_GAP)
-            canvas.paste(panel, (x, y))
-            draw.rectangle(
-                (x, y, x + PANEL_WIDTH, y + PANEL_HEIGHT),
-                outline=(85, 94, 108),
-                width=2,
-            )
+        _draw_ego_marker(draw, x, TOP_MARGIN)
 
-        metric_y = y + PANEL_HEIGHT + 10
-        learned_x = LEFT_MARGIN + PANEL_WIDTH + PANEL_GAP
-        persistence_x = learned_x + PANEL_WIDTH + PANEL_GAP
-        _draw_centered(
-            draw,
-            learned_x + PANEL_WIDTH // 2,
-            metric_y,
-            f"Brier {values['learned_brier']:.3f}",
-            _font(19),
-            (121, 211, 173),
-        )
-        _draw_centered(
-            draw,
-            persistence_x + PANEL_WIDTH // 2,
-            metric_y,
-            f"Brier {values['persistence_brier']:.3f}",
-            _font(19),
-            (255, 174, 102),
-        )
+    metric_y = TOP_MARGIN + PANEL_HEIGHT + 12
+    learned_x = LEFT_MARGIN + PANEL_WIDTH + PANEL_GAP
+    persistence_x = learned_x + PANEL_WIDTH + PANEL_GAP
+    _draw_centered(
+        draw,
+        learned_x + PANEL_WIDTH // 2,
+        metric_y,
+        f"Brier error {values['learned_brier']:.3f}",
+        _font(19),
+        (121, 211, 173),
+    )
+    _draw_centered(
+        draw,
+        persistence_x + PANEL_WIDTH // 2,
+        metric_y,
+        f"Brier error {values['persistence_brier']:.3f}",
+        _font(19),
+        (255, 174, 102),
+    )
 
-    legend_y = canvas_height - 105
+    legend_y = 700
     draw.text(
         (48, legend_y),
         "Forecast probability",
@@ -336,9 +334,12 @@ def render(
         fill=(177, 185, 196),
     )
     draw.text(
-        (48, canvas_height - 48),
-        "Map view: forward is up. Each pixel represents 0.5 m. Lower Brier is better.",
-        font=_font(19),
+        (48, 755),
+        (
+            f"Forward is up. The blue box marks the vehicle at planning time. "
+            f"Short-horizon Brier gain {improvement:.4f}; test median {median_improvement:.4f}."
+        ),
+        font=_font(17),
         fill=(177, 185, 196),
     )
 
