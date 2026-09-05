@@ -1,132 +1,80 @@
-# Alpamayo-R1 Trajectory Audit
+# Auditing Alpamayo-R1 Planning
 
-This project tests how an autonomous-driving model explains and selects vehicle
-motion. It connects three outputs that are usually inspected separately:
+NVIDIA's Alpamayo-R1-10B reads four recent camera streams and the vehicle's
+recent motion. It then explains a driving decision and plans the vehicle's next
+6.4 seconds. This repository tests the public model at the link between
+explanation, motion, and future road occupancy.
 
-- The model's written driving reasoning
-- Multiple candidate vehicle trajectories
-- A learned forecast of future occupied road space
+[Paper](https://arxiv.org/abs/2511.00088) ·
+[Model](https://huggingface.co/nvidia/Alpamayo-R1-10B) ·
+[Official code](https://github.com/NVlabs/alpamayo) ·
+[Public data](https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicles)
 
-The result is a reproducible audit pipeline for Alpamayo-R1-10B. It converts
-model outputs and recorded LiDAR into traceable artifacts, measurements, and a
-machine-readable benchmark report.
+## What Alpamayo-R1 Does
 
-![Project pipeline from recorded inputs to reproducible audit artifacts](docs/assets/project_pipeline.svg)
+Alpamayo-R1 is a vision-language-action model for difficult driving cases. Its
+Cosmos-Reason backbone writes a **Chain of Causation**. This text links visible
+road facts to an intended response. A diffusion decoder then produces 64 future
+vehicle positions at 10 Hz.
 
-## What This Project Does
+NVIDIA trained the model on 80,000 hours of internal driving data and 700,000
+structured reasoning traces. The paper also uses reinforcement learning to
+improve agreement between words and motion. The public v1.0 checkpoint contains
+the supervised training stage, but not the paper's reinforcement-learning
+weights.
 
-Alpamayo-R1 receives camera data and ego-motion history. It produces a written
-Chain of Causation and a 6.4-second trajectory. A trajectory can look plausible
-while it disagrees with the written intent or passes through future occupied
-space.
+The core idea is important: an explanation is useful only when the planned
+motion follows it. This repository turns that link into a test on public data.
 
-This project answers three concrete questions:
+## What We Built
 
-| Question | Method | Output |
-| --- | --- | --- |
-| Does the explanation match the motion? | Classify the text intent and trajectory action | Reasoning-action mismatch score |
-| Can past LiDAR predict future occupied space? | Train a compact occupancy forecaster | Six future probability maps |
-| How do candidate paths interact with occupied space? | Place the vehicle footprint along each path | Per-candidate exposure and coverage values |
+We did not train Alpamayo-R1. We evaluated its released checkpoint at a pinned
+revision on 2,000 clips from the PhysicalAI-AV dataset. The project adds:
 
-The occupancy model is a 339,910-parameter convolutional recurrent network.
-Training starts with random weights. Recorded future LiDAR supplies the target.
-Alpamayo-R1-10B supplies six candidate trajectories for each clip.
+- A rule-based audit of stated intent against generated motion
+- Six repeatable Alpamayo-R1 paths per clip, or 12,000 paths in total
+- A 339,910-parameter LiDAR occupancy model trained from random weights
+- A held-out test of forecast quality and path exposure
 
-The term *world model* has a specific meaning in this repository. It means a
-model that predicts future LiDAR occupancy in a fixed bird's-eye-view grid. It
-does not mean a general driving simulator.
+The occupancy model is the **world model** in this project. It receives three
+LiDAR maps from the previous second. It predicts LiDAR occupancy at 0.5, 1, 2,
+3, 4, and 6 seconds. Recorded future LiDAR supplies the training target. This is
+a focused scene forecast, not a general simulator or a crash predictor.
 
-## Features
+## What We Found
 
-- **Reasoning-action audit:** Compare the written driving intent with the motion
-  in the generated trajectory.
-- **Reproducible candidates:** Generate six seeded Alpamayo trajectories for
-  each clip and store their source identity.
-- **Future occupancy forecast:** Use three past LiDAR maps to predict six future
-  occupancy maps from 0.5 to 6 seconds.
-- **Trajectory exposure audit:** Compare each vehicle footprint with predicted
-  occupancy. Use recorded occupancy only after selection to score the result.
-- **Leakage-safe evaluation:** Keep each LiDAR source chunk in only one of the
-  training, validation, or test sets.
-- **Traceable artifacts:** Store configuration fingerprints, source revisions,
-  file hashes, checkpoint identity, and split identity.
-- **Cluster execution:** Run candidate generation, label construction, two-seed
-  GPU training, and evaluation through SLURM.
+**The audit found a measurable reasoning-action gap.** Under the documented
+action-class rules, 833 of 2,000 clips had a mismatch score of at least 0.6.
+Curved roads can affect the lateral score because the test uses the vehicle
+coordinate frame. The result is an audit signal, not an unsafe-plan rate.
 
-The main outputs are:
+**The world model learned useful scene motion.** The split used 1,612 training,
+180 validation, and 208 test clips. Source recording chunks do not cross the
+splits. On held-out clips, the model beat a baseline that copies the current
+map at every forecast time through six seconds. From 0.5 to 2 seconds, occupied
+cell ranking improved by 0.217, probability error fell by 0.0259, and occupancy
+overlap improved by 0.0386. Each paired 95 percent interval excludes zero.
 
-| Artifact | Content |
-| --- | --- |
-| Candidate NPZ | Six trajectories, reasoning text, seeds, and clip identity |
-| Occupancy NPZ | Past maps, future labels, observation masks, and geometry |
-| Prediction NPZ | Future occupancy probabilities and checkpoint identity |
-| Selection JSONL | Selected candidate, component scores, and input hashes |
-| Benchmark JSON | Final metrics, intervals, revisions, and artifact hashes |
+**The six paths contain useful alternatives.** An evaluation-only oracle used
+recorded future LiDAR to choose a path. Its geometric exposure was 0.01685,
+compared with 0.03199 for the first path. This is a 47 percent reduction.
+Exposure counts observed vehicle-footprint cells that contain future LiDAR
+returns. It is not crash probability. The forecast-based selector scored
+0.03868. This localizes the engineering gap: forecast quality alone does not
+produce good path selection.
 
-## Quick Start
+The result is a reproducible audit from stated reason to planned motion to
+future scene state. Researchers can replace any one of these components while
+keeping the same split, artifact checks, and evaluation.
 
-Run the small CPU demo before you download a model or dataset:
+## Evidence and Code
 
-```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements/demo.txt
-.venv/bin/python -m tools.quick_demo
-```
+- [Methods, metric definitions, and complete results](docs/benchmark_results.md)
+- [Candidate generation and SLURM runbook](docs/candidate_generation.md)
+- [World-model design and training](docs/bev_world_model.md)
+- [Recorded-future LiDAR oracle](docs/lidar_world_oracle.md)
+- [Machine-readable results and artifact hashes](reports/world_model_benchmark_2k.json)
 
-The demo creates deterministic moving objects on a small grid. It trains the
-same occupancy-network class used by the full project. It then compares the
-learned forecast with a baseline that copies the current map into the future.
-
-The command finishes in less than one minute on a typical CPU. It writes a
-forecast image and a JSON report to `results/quick_demo/`.
-
-The demo uses generated data so that it needs no credentials, GPU, NVIDIA model,
-or driving-dataset download. Use the full runbooks for the 2,000-clip benchmark.
-
-## Results
-
-The complete benchmark processed 2,000 clips and 12,000 candidate trajectories.
-All scheduled stages completed without a runtime error.
-
-| Study | Result | Meaning |
-| --- | --- | --- |
-| Reasoning and action | 41.65 percent of clips had a severe mismatch under the documented class rules | Written intent and generated motion frequently differed |
-| Occupancy forecast | The learned model improved all three forecast measures at every tested horizon | Past LiDAR contained useful predictive information beyond a copy of the current map |
-| Candidate availability | The recorded-future reference found 47 percent lower mean exposure within the six candidates | The candidate set contained measurable trajectory headroom |
-| Candidate selection | Candidate 0 outperformed the tested learned selector | Forecast quality and path-selection quality are separate engineering problems |
-
-The forecast result uses 208 held-out clips from 67 source chunks. The primary
-short-horizon comparison is:
-
-| Measure | Learned | Copy-current | Better direction |
-| --- | ---: | ---: | --- |
-| Average precision | 0.815 | 0.598 | Higher |
-| Brier score | 0.098 | 0.124 | Lower |
-| Occupancy overlap | 0.599 | 0.561 | Higher |
-
-Average precision checks the probability ranking. Brier score measures
-probability error. Occupancy overlap measures the shared predicted and recorded
-area. These values are not percentages of correct cells.
-
-Collision exposure is the fraction of observed vehicle-footprint cells that
-contain recorded LiDAR endpoints. It is a geometric overlap measure, not a
-crash probability.
-
-Read the [benchmark results](docs/benchmark_results.md) for the complete metric
-definitions, confidence intervals, path-selection results, map coverage, and
-GPU execution record.
-
-## Documentation
-
-| Document | Purpose |
-| --- | --- |
-| [Benchmark results](docs/benchmark_results.md) | Methods, plain-language metric definitions, exact results, and interpretation |
-| [Candidate generation](docs/candidate_generation.md) | Alpamayo setup, output format, and SLURM commands |
-| [Occupancy forecasting](docs/bev_world_model.md) | Data contract, training, evaluation, and benchmark submission |
-| [LiDAR oracle](docs/lidar_world_oracle.md) | Coordinate transforms, occupancy construction, and trajectory exposure |
-| [Machine-readable report](reports/world_model_benchmark_2k.json) | Full-precision values, immutable revisions, and artifact hashes |
-
-The benchmark uses the
-[NVIDIA Alpamayo-R1-10B model](https://huggingface.co/nvidia/Alpamayo-R1-10B),
-the [PhysicalAI Autonomous Vehicles dataset](https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicles),
-and the [NVlabs Alpamayo source](https://github.com/NVlabs/alpamayo).
+Two NVIDIA RTX A4500 GPUs trained independent seeds for 30 epochs. The runs
+finished in 468 and 469 seconds. A third GPU job generated held-out forecasts.
+All 122 tests pass.

@@ -1,4 +1,0 @@
-# Minimal dependencies for tools/quick_demo.py.
-numpy==2.3.5
-pillow==12.0.0
-torch==2.8.0
